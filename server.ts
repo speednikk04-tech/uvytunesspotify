@@ -49,8 +49,19 @@ const createCustomFetch = (cookieInput?: any) => {
   };
 };
 
-// @ts-ignore
-const spotify = spotifyUrlInfo(createCustomFetch());
+// Safe initializer for spotify-url-info supporting CJS/ESM interop
+function initSpotifyUrlInfo(customFetchFn: any) {
+  try {
+    // @ts-ignore
+    const fn = typeof spotifyUrlInfo === "function" ? spotifyUrlInfo : (spotifyUrlInfo && spotifyUrlInfo.default);
+    if (typeof fn === "function") {
+      return fn(customFetchFn);
+    }
+  } catch (e) {
+    console.warn("Could not initialize spotify-url-info:", e);
+  }
+  return null;
+}
 
 // Spotify Web Player TOTP algorithm & token caching
 const secretDefs = [
@@ -639,20 +650,21 @@ async function fetchSpotifyOembed(url: string, cookieInput?: any): Promise<any> 
 // Master Safe Scraper with Timeout & 4 Fallback Tiers
 async function safeGetSpotifyData(url: string, cookieInput?: any): Promise<any> {
   const customFetch = createCustomFetch(cookieInput);
-  // @ts-ignore
-  const customSpotify = spotifyUrlInfo(customFetch);
+  const customSpotify = initSpotifyUrlInfo(customFetch);
 
   // Attempt 1: spotify-url-info with custom browser headers
-  try {
-    const data = await Promise.race([
-      customSpotify.getData(url),
-      new Promise((_, reject) => setTimeout(() => reject(new Error("spotifyUrlInfo timeout")), 5000))
-    ]);
-    if (data && (data.title || data.name || data.trackList || data.tracks)) {
-      return data;
+  if (customSpotify && typeof customSpotify.getData === "function") {
+    try {
+      const data = await Promise.race([
+        customSpotify.getData(url),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("spotifyUrlInfo timeout")), 5000))
+      ]);
+      if (data && (data.title || data.name || data.trackList || data.tracks)) {
+        return data;
+      }
+    } catch (e: any) {
+      console.warn(`Attempt 1 (spotify.getData) failed for ${url}:`, e.message);
     }
-  } catch (e: any) {
-    console.warn(`Attempt 1 (spotify.getData) failed for ${url}:`, e.message);
   }
 
   // Attempt 2: Direct Spotify Embed HTML Page parsing
@@ -1295,7 +1307,7 @@ async function refreshHostedItem(idOrSlug: string): Promise<HostedItem | null> {
         if (secData.title) name = secData.title;
       }
     } else {
-      const rawData = await spotify.getData(item.sourceUrl);
+      const rawData = await safeGetSpotifyData(item.sourceUrl, item.cookies);
       const enriched = await enrichSpotifyData(rawData, item.cookies);
       if (enriched) {
         freshTracks = enriched.trackList || (enriched.tracks ? (Array.isArray(enriched.tracks) ? enriched.tracks : enriched.tracks.items) : []);
