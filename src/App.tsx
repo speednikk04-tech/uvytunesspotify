@@ -12,14 +12,14 @@ const normalizeData = (parsed: any): { unified: UnifiedPlaylist | null; unifiedS
   if (!parsed) return { unified: null, unifiedSection: null, raw: null };
 
   try {
-    // 1. Spotify Section format
-    if (parsed.type === 'section' && Array.isArray(parsed.playlists)) {
+    // 1. Spotify Section format (check explicit type === 'section' OR presence of playlists array)
+    if ((parsed.type === 'section' || Array.isArray(parsed.playlists)) && Array.isArray(parsed.playlists) && parsed.playlists.length > 0) {
       return {
         unified: null,
         unifiedSection: {
           type: 'section',
           id: parsed.id || 'unknown',
-          title: parsed.title || 'Spotify Section',
+          title: parsed.title || parsed.name || 'Spotify Section',
           subtitle: parsed.subtitle || '',
           countryCode: parsed.countryCode || 'US',
           playlistCount: parsed.playlistCount || parsed.playlists.length,
@@ -33,12 +33,12 @@ const normalizeData = (parsed: any): { unified: UnifiedPlaylist | null; unifiedS
             shelf: pl.shelf || undefined,
             isAlbum: pl.isAlbum || false,
             coverUrl: pl.coverUrl || pl.images?.[0]?.url || null,
-            trackCount: pl.trackCount || pl.trackList?.length || 0,
-            trackList: (pl.trackList || []).map((t: any) => ({
+            trackCount: pl.trackCount || pl.trackList?.length || (Array.isArray(pl.tracks) ? pl.tracks.length : 0),
+            trackList: (pl.trackList || (Array.isArray(pl.tracks) ? pl.tracks : [])).map((t: any) => ({
               id: t.id || (t.uri ? t.uri.split(':').pop() : Math.random().toString()),
               uri: t.uri,
               title: t.title || t.name || 'Unknown Title',
-              artist: t.artist || t.subtitle || t.artists?.map((a: any) => a.name).join(', ') || 'Unknown Artist',
+              artist: t.artist || t.subtitle || (Array.isArray(t.artists) ? t.artists.map((a: any) => a.name).join(', ') : 'Unknown Artist'),
               album: t.album || (pl.isAlbum ? pl.name : `${t.title || t.name} - Single`),
               coverUrl: t.coverUrl || (pl.isAlbum ? pl.coverUrl : null) || pl.coverUrl || null,
               previewUrl: t.previewUrl || t.audioPreview?.url || t.preview_url || null,
@@ -106,24 +106,28 @@ const normalizeData = (parsed: any): { unified: UnifiedPlaylist | null; unifiedS
       };
     }
 
-    // 4. Spotify Scraped Data (Playlist / Album / Track)
-    if (parsed.type && ['playlist', 'album', 'track'].includes(parsed.type)) {
-      let tracks: any[] = [];
-      if (parsed.type === 'track') {
-        tracks = [parsed];
-      } else if (parsed.tracks?.items) {
-        tracks = parsed.tracks.items.map((item: any) => item.track || item);
-      } else if (parsed.trackList) {
-        tracks = parsed.trackList;
-      }
+    // 4. Spotify Scraped Data / Any Track List or Playlist structure
+    let tracks: any[] = [];
+    if (parsed.type === 'track' || (!parsed.trackList && !parsed.tracks && (parsed.title || parsed.name) && (parsed.artist || parsed.artists))) {
+      tracks = [parsed];
+    } else if (Array.isArray(parsed.trackList)) {
+      tracks = parsed.trackList;
+    } else if (Array.isArray(parsed.tracks?.items)) {
+      tracks = parsed.tracks.items.map((item: any) => item.track || item);
+    } else if (Array.isArray(parsed.tracks)) {
+      tracks = parsed.tracks;
+    } else if (Array.isArray(parsed.items)) {
+      tracks = parsed.items;
+    }
 
-      const playlistCover = parsed.images?.[0]?.url || parsed.coverArt?.sources?.[0]?.url || parsed.image?.[0]?.url || null;
+    if (tracks.length > 0) {
+      const playlistCover = parsed.coverUrl || parsed.images?.[0]?.url || parsed.coverArt?.sources?.[0]?.url || parsed.image?.[0]?.url || null;
 
       return {
         unifiedSection: null,
         unified: {
-          title: parsed.name || parsed.title || 'Spotify Data',
-          author: parsed.owner?.display_name || parsed.subtitle || parsed.artists?.[0]?.name || 'Spotify User',
+          title: parsed.name || parsed.title || 'Scraped Spotify Playlist',
+          author: parsed.owner?.display_name || parsed.subtitle || (typeof parsed.owner === 'string' ? parsed.owner : null) || parsed.artists?.[0]?.name || 'Spotify User',
           trackCount: tracks.length,
           coverUrl: playlistCover,
           tracks: tracks.map((track: any) => {
@@ -147,7 +151,7 @@ const normalizeData = (parsed: any): { unified: UnifiedPlaylist | null; unifiedS
               id: track.id || track.uri || track.uid || Math.random().toString(),
               uri: track.uri,
               title: track.name || track.title || 'Unknown Title',
-              artist: track.artists?.map((a: any) => a.name).join(', ') || track.subtitle || track.artist || 'Unknown Artist',
+              artist: typeof track.artist === 'string' ? track.artist : (Array.isArray(track.artists) ? track.artists.map((a: any) => a.name || a).join(', ') : (track.subtitle || 'Unknown Artist')),
               album: trackAlbumName,
               coverUrl: finalCover,
               previewUrl: track.preview_url || track.audioPreview?.url || track.previewUrl || null,
@@ -160,7 +164,29 @@ const normalizeData = (parsed: any): { unified: UnifiedPlaylist | null; unifiedS
       };
     }
 
-    // Generic / Fallback
+    // Generic Fallback (if parsed is an array or object)
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return {
+        unifiedSection: null,
+        unified: {
+          title: 'Imported Playlist Array',
+          author: 'Custom JSON',
+          trackCount: parsed.length,
+          coverUrl: parsed[0]?.coverUrl || null,
+          tracks: parsed.map((track: any) => ({
+            id: track.id || Math.random().toString(),
+            title: track.title || track.name || 'Unknown Title',
+            artist: track.artist || 'Unknown Artist',
+            album: track.album || 'Unknown Album',
+            coverUrl: track.coverUrl || null,
+            previewUrl: track.previewUrl || null,
+            durationMs: track.durationMs || 0
+          }))
+        },
+        raw: parsed
+      };
+    }
+
     return { unified: null, unifiedSection: null, raw: parsed };
   } catch (e) {
     return { unified: null, unifiedSection: null, raw: parsed };
@@ -511,8 +537,26 @@ export default function App() {
           } else if (unified) {
             setUnifiedData(unified);
             setUnifiedSection(null);
+          } else if (data) {
+            const trackList = data.trackList || (Array.isArray(data.tracks) ? data.tracks : []);
+            setUnifiedData({
+              title: data.name || data.title || 'Scraped Playlist',
+              author: data.owner?.display_name || data.subtitle || (typeof data.owner === 'string' ? data.owner : 'Spotify User'),
+              trackCount: trackList.length || 1,
+              coverUrl: data.coverUrl || data.images?.[0]?.url || null,
+              tracks: trackList.map((t: any, idx: number) => ({
+                id: t.id || t.uri || `track-${idx}`,
+                title: t.title || t.name || 'Unknown Title',
+                artist: t.artist || t.subtitle || (Array.isArray(t.artists) ? t.artists.map((a: any) => a.name).join(', ') : 'Unknown Artist'),
+                album: t.album || 'Spotify Track',
+                coverUrl: t.coverUrl || data.coverUrl || null,
+                previewUrl: t.previewUrl || t.audioPreview?.url || null,
+                durationMs: t.durationMs || t.duration || 0
+              }))
+            });
+            setUnifiedSection(null);
           }
-          setRawData(raw);
+          setRawData(raw || data);
           setShowSpotifyScraper(false);
         }}
         onVisualizeSection={(section) => {
