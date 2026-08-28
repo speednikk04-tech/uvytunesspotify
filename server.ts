@@ -5,8 +5,52 @@ import fs from "fs";
 // @ts-ignore
 import spotifyUrlInfo from "spotify-url-info";
 
+// Hardcoded Cloudflare Worker Proxy URL for Spotify Edge Scraper
+const HARDCODED_CF_WORKER_URL = "https://spotify.nikkexe.workers.dev";
+
+// Create custom fetch with Chrome User-Agent & Headers to bypass Cloudflare / Datacenter IP blocks on Vercel
+const createCustomFetch = (cookieInput?: any) => {
+  const parsed = parseSpotifyCookies(cookieInput);
+  const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : undefined);
+
+  return (url: string, opts: any = {}) => {
+    // Route requests through Cloudflare Worker Proxy
+    const workerProxy = process.env.CF_WORKER_URL || HARDCODED_CF_WORKER_URL;
+    let targetUrl = url;
+    if (workerProxy) {
+      const cleanProxy = workerProxy.replace(/\/$/, "");
+      targetUrl = `${cleanProxy}/proxy?url=${encodeURIComponent(url)}`;
+    }
+
+    const headers: Record<string, string> = {
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Cache-Control": "no-cache",
+      "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "Sec-Ch-Ua-Mobile": "?0",
+      "Sec-Ch-Ua-Platform": '"macOS"',
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "same-origin",
+      "Sec-Fetch-User": "?1",
+      "Upgrade-Insecure-Requests": "1",
+      ...(opts.headers || {})
+    };
+
+    if (cookieHeader && !headers["Cookie"]) {
+      headers["Cookie"] = cookieHeader;
+    }
+
+    return fetch(targetUrl, {
+      ...opts,
+      headers
+    });
+  };
+};
+
 // @ts-ignore
-const spotify = spotifyUrlInfo(fetch);
+const spotify = spotifyUrlInfo(createCustomFetch());
 
 // Spotify Web Player TOTP algorithm & token caching
 const secretDefs = [
@@ -501,6 +545,138 @@ async function resolveTrackDetails(title: string, artist: string): Promise<{ cov
   return fallback;
 }
 
+// Extract entity type and ID from Spotify URL or URI
+function parseSpotifyUrl(input: string): { type: 'playlist' | 'album' | 'track' | 'section' | 'unknown'; id: string } {
+  if (!input) return { type: 'unknown', id: '' };
+  const str = input.trim();
+  if (str.startsWith('spotify:')) {
+    const parts = str.split(':');
+    return { type: (parts[1] as any) || 'unknown', id: parts[2] || '' };
+  }
+  const match = str.match(/spotify\.com\/(playlist|album|track|section|hub|genre|category)\/([a-zA-Z0-9]+)/i);
+  if (match) {
+    return { type: (match[1].toLowerCase() as any), id: match[2] };
+  }
+  return { type: 'unknown', id: '' };
+}
+
+// Fallback Tier 2: Fetch and parse Spotify Embed page HTML
+async function fetchSpotifyEmbedPage(url: string, cookieInput?: any): Promise<any> {
+  const { type, id } = parseSpotifyUrl(url);
+  if (!id || (type !== 'playlist' && type !== 'album' && type !== 'track')) {
+    return null;
+  }
+
+  const embedUrl = `https://open.spotify.com/embed/${type}/${id}`;
+  const customFetch = createCustomFetch(cookieInput);
+  const res = await customFetch(embedUrl);
+  if (!res.ok) return null;
+
+  const html = await res.text();
+  
+  // Extract JSON objects inside embed HTML
+  const scriptMatch = html.match(/<script[^>]*id="(session|initial-state|__NEXT_DATA__)"[^>]*>([\s\S]*?)<\/script>/i)
+    || html.match(/<script[^>]*type="application\/json"[^>]*>([\s\S]*?)<\/script>/i);
+
+  if (scriptMatch && scriptMatch[2]) {
+    try {
+      const parsed = JSON.parse(scriptMatch[2]);
+      if (parsed) return parsed;
+    } catch {}
+  }
+
+  const resourceMatch = html.match(/("resource"\s*:\s*\{[\s\S]*?\}\s*,\s*"|Spotify\.Entity\s*=\s*|\{"type":"(playlist|album|track)"[\s\S]*?\})/i);
+  if (resourceMatch) {
+    try {
+      const jsonStart = html.indexOf('{"type":"') >= 0 ? html.indexOf('{"type":"') : html.indexOf('"resource":');
+      const jsonStr = html.substring(jsonStart);
+      const endIdx = jsonStr.indexOf('</script>');
+      const cleanJson = endIdx > 0 ? jsonStr.substring(0, endIdx).trim().replace(/;$/, '') : jsonStr;
+      const parsed = JSON.parse(cleanJson);
+      if (parsed) return parsed.resource || parsed;
+    } catch {}
+  }
+
+  return null;
+}
+
+// Fallback Tier 3: Fetch Spotify oEmbed API + iTunes Track Details
+async function fetchSpotifyOembed(url: string, cookieInput?: any): Promise<any> {
+  const { type, id } = parseSpotifyUrl(url);
+  const customFetch = createCustomFetch(cookieInput);
+  const oembedRes = await customFetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`);
+
+  if (!oembedRes.ok) return null;
+  const oembed = await oembedRes.json();
+  if (!oembed || !oembed.title) return null;
+
+  const title = oembed.title || "Spotify Entity";
+  const author = oembed.author_name || "Spotify User";
+  const coverUrl = oembed.thumbnail_url || null;
+
+  const trackDetails = await resolveTrackDetails(title, author);
+
+  return {
+    type: type || "playlist",
+    name: title,
+    title: title,
+    description: `Imported via Spotify oEmbed • ${author}`,
+    owner: { display_name: author },
+    images: coverUrl ? [{ url: coverUrl }] : [],
+    trackList: [
+      {
+        id: id || Math.random().toString(),
+        uri: `spotify:${type}:${id}`,
+        title: title,
+        name: title,
+        artist: author,
+        album: trackDetails.album || `${title} - Single`,
+        coverUrl: trackDetails.coverUrl || coverUrl,
+        audioPreview: null,
+        duration: 0
+      }
+    ]
+  };
+}
+
+// Master Safe Scraper with Timeout & 4 Fallback Tiers
+async function safeGetSpotifyData(url: string, cookieInput?: any): Promise<any> {
+  const customFetch = createCustomFetch(cookieInput);
+  // @ts-ignore
+  const customSpotify = spotifyUrlInfo(customFetch);
+
+  // Attempt 1: spotify-url-info with custom browser headers
+  try {
+    const data = await Promise.race([
+      customSpotify.getData(url),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("spotifyUrlInfo timeout")), 5000))
+    ]);
+    if (data && (data.title || data.name || data.trackList || data.tracks)) {
+      return data;
+    }
+  } catch (e: any) {
+    console.warn(`Attempt 1 (spotify.getData) failed for ${url}:`, e.message);
+  }
+
+  // Attempt 2: Direct Spotify Embed HTML Page parsing
+  try {
+    const embedData = await fetchSpotifyEmbedPage(url, cookieInput);
+    if (embedData) return embedData;
+  } catch (e: any) {
+    console.warn(`Attempt 2 (fetchSpotifyEmbedPage) failed for ${url}:`, e.message);
+  }
+
+  // Attempt 3: Spotify oEmbed API fallback
+  try {
+    const oembedData = await fetchSpotifyOembed(url, cookieInput);
+    if (oembedData) return oembedData;
+  } catch (e: any) {
+    console.warn(`Attempt 3 (fetchSpotifyOembed) failed for ${url}:`, e.message);
+  }
+
+  throw new Error(`Unable to scrape Spotify data for URL. Please verify the URL or provide your Spotify sp_dc cookie.`);
+}
+
 function formatShelfTitle(rawShelf: any): string {
   if (!rawShelf) return "Featured Shelves";
   const s = String(rawShelf).trim();
@@ -834,7 +1010,7 @@ async function scrapeSpotifySection(sectionId: string, countryCode = "US", maxPl
             ? `https://open.spotify.com/album/${pl.id}`
             : `https://open.spotify.com/playlist/${pl.id}`;
           
-          const plData = await spotify.getData(fetchUrl);
+          const plData = await safeGetSpotifyData(fetchUrl, cookieInput);
           const rawTrackList = plData.trackList || plData.tracks?.items || [];
           const plCover = plData.images?.[0]?.url || pl.coverUrl || null;
 
@@ -1432,14 +1608,17 @@ const handleScrapeRequest = async (req: express.Request, res: express.Response) 
       return res.json(sectionData);
     }
     
-    // Otherwise scrape playlist / album / track
-    const rawData = await spotify.getData(url);
+    // Otherwise scrape playlist / album / track via safeGetSpotifyData
+    const rawData = await safeGetSpotifyData(url, cookies);
     const enrichedData = await enrichSpotifyData(rawData, cookies);
     
-    res.json(enrichedData);
+    return res.json(enrichedData);
   } catch (err: any) {
     console.error("Scraping error:", err);
-    res.status(500).json({ error: err.message || "Failed to scrape Spotify data" });
+    return res.status(400).json({ 
+      error: err.message || "Failed to scrape Spotify data",
+      tip: "If this playlist is private or geo-restricted, paste your sp_dc cookie into the cookie settings."
+    });
   }
 };
 

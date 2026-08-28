@@ -292,26 +292,61 @@ export default function App() {
 
       if (url.includes('spotify.com') || url.startsWith('spotify:')) {
         const activeCookie = spotifyCookies || localStorage.getItem('spotify_user_session_cookies') || '';
-        const response = await fetch(`/api/scrape`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url, cookies: activeCookie })
-        });
-        if (!response.ok) {
-          const err = await response.json();
-          throw new Error(err.error || `HTTP error! status: ${response.status}`);
+        try {
+          const response = await fetch(`/api/scrape`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, cookies: activeCookie })
+          });
+          if (response.ok) {
+            const data = await response.json();
+            const { unified, unifiedSection: section, raw } = normalizeData(data);
+            if (section) {
+              setUnifiedSection(section);
+              setUnifiedData(null);
+            } else if (unified) {
+              setUnifiedData(unified);
+              setUnifiedSection(null);
+            }
+            setRawData(raw);
+            return;
+          } else {
+            const err = await response.json().catch(() => ({}));
+            console.warn("Backend API scrape notice:", err);
+          }
+        } catch (apiErr) {
+          console.warn("Backend API scrape failed, attempting client-side oEmbed fallback...", apiErr);
         }
-        const data = await response.json();
-        const { unified, unifiedSection: section, raw } = normalizeData(data);
-        if (section) {
-          setUnifiedSection(section);
-          setUnifiedData(null);
-        } else if (unified) {
-          setUnifiedData(unified);
-          setUnifiedSection(null);
+
+        // Direct client-side oEmbed fallback if backend API fails
+        try {
+          const oembedRes = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`);
+          if (oembedRes.ok) {
+            const oembed = await oembedRes.json();
+            const fallbackData = {
+              type: 'playlist',
+              name: oembed.title || 'Spotify Playlist',
+              owner: { display_name: oembed.author_name || 'Spotify User' },
+              images: oembed.thumbnail_url ? [{ url: oembed.thumbnail_url }] : [],
+              trackList: [
+                {
+                  id: 'oembed-fallback',
+                  title: oembed.title || 'Spotify Track',
+                  artist: oembed.author_name || 'Spotify',
+                  coverUrl: oembed.thumbnail_url || null
+                }
+              ]
+            };
+            const { unified, raw } = normalizeData(fallbackData);
+            if (unified) setUnifiedData(unified);
+            setRawData(raw);
+            return;
+          }
+        } catch (oembedErr) {
+          console.error("Client oEmbed fallback error:", oembedErr);
         }
-        setRawData(raw);
-        return;
+
+        throw new Error("Unable to fetch Spotify playlist. Please check the URL or paste your Spotify sp_dc cookie.");
       }
 
       const response = await fetch(url);
