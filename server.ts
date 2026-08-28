@@ -1161,172 +1161,180 @@ export const app = express();
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-async function startServer() {
-  const PORT = 3000;
+// Enable CORS for all API routes
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-spotify-cookies, x-spotify-sp-dc");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
-  // === HOSTED PLAYLISTS API ENDPOINTS ===
+// === HOSTED PLAYLISTS API ENDPOINTS ===
 
-  // List all published API endpoints
-  app.get("/api/hosted/list", (req, res) => {
-    const items = Object.values(hostedStore).map(item => ({
-      ...item,
-      publicUrl: `/api/public/${item.slug}.json`,
-      directUrl: `/api/${item.slug}.json`,
-      vercelUrl: `https://uvytunesspotify.vercel.app/api/${item.slug}.json`
-    }));
-    res.json({ count: items.length, items });
-  });
+// List all published API endpoints
+app.get("/api/hosted/list", (req, res) => {
+  const items = Object.values(hostedStore).map(item => ({
+    ...item,
+    publicUrl: `/api/public/${item.slug}.json`,
+    directUrl: `/api/${item.slug}.json`,
+    vercelUrl: `https://uvytunesspotify.vercel.app/api/${item.slug}.json`
+  }));
+  res.json({ count: items.length, items });
+});
 
-  // Serve / Publish a playlist to API
-  app.post("/api/hosted/add", async (req, res) => {
-    try {
-      const { name, description, sourceUrl, sourceType, tracks, coverUrl, autoUpdateDaily, cookies, slug: rawSlug } = req.body;
+// Serve / Publish a playlist to API
+app.post("/api/hosted/add", async (req, res) => {
+  try {
+    const { name, description, sourceUrl, sourceType, tracks, coverUrl, autoUpdateDaily, cookies, slug: rawSlug } = req.body;
 
-      if (!name || !sourceUrl) {
-        return res.status(400).json({ error: "name and sourceUrl are required" });
-      }
-
-      const slug = sanitizeSlug(rawSlug || name);
-      const id = crypto.randomUUID();
-      const now = new Date();
-      const next24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-
-      const newItem: HostedItem = {
-        id,
-        slug,
-        name,
-        description: description || `Served Spotify ${sourceType || 'playlist'}`,
-        sourceUrl,
-        sourceType: sourceType || (sourceUrl.includes('/section/') ? 'section' : 'playlist'),
-        trackCount: Array.isArray(tracks) ? tracks.length : 0,
-        coverUrl: coverUrl || null,
-        lastUpdated: now.toISOString(),
-        nextRefreshAt: next24h.toISOString(),
-        autoUpdateDaily: autoUpdateDaily !== false,
-        cookies: cookies || undefined,
-        tracks: Array.isArray(tracks) ? tracks : []
-      };
-
-      hostedStore[slug] = newItem;
-      saveHostedStore();
-
-      res.json({
-        success: true,
-        message: `Playlist successfully published to API!`,
-        slug: newItem.slug,
-        item: newItem,
-        publicUrl: `/api/public/${newItem.slug}.json`,
-        directUrl: `/api/${newItem.slug}.json`,
-        vercelUrl: `https://uvytunesspotify.vercel.app/api/${newItem.slug}.json`
-      });
-    } catch (err: any) {
-      console.error("Error serving playlist to API:", err);
-      res.status(500).json({ error: err.message || "Failed to publish playlist to API" });
+    if (!name || !sourceUrl) {
+      return res.status(400).json({ error: "name and sourceUrl are required" });
     }
-  });
 
-  // Force Refresh Hosted Endpoint
-  app.post("/api/hosted/refresh/:id", async (req, res) => {
-    try {
-      const updated = await refreshHostedItem(req.params.id);
-      if (!updated) {
-        return res.status(404).json({ error: "Hosted endpoint not found" });
-      }
-      res.json({ success: true, item: updated });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || "Failed to refresh endpoint" });
-    }
-  });
+    const slug = sanitizeSlug(rawSlug || name);
+    const id = crypto.randomUUID();
+    const now = new Date();
+    const next24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
 
-  // Delete Hosted Endpoint
-  app.delete("/api/hosted/:id", (req, res) => {
-    const idOrSlug = req.params.id;
-    const key = Object.keys(hostedStore).find(k => hostedStore[k].id === idOrSlug || hostedStore[k].slug === idOrSlug || k === idOrSlug);
-
-    if (key && hostedStore[key]) {
-      delete hostedStore[key];
-      saveHostedStore();
-      return res.json({ success: true, message: "Endpoint deleted" });
-    }
-    res.status(404).json({ error: "Endpoint not found" });
-  });
-
-  // Public GET Endpoint for fetching playlist JSON (Supports /api/public/:slug.json, /api/hosted/:slug.json, and /api/:slug.json)
-  const handleServePublicJson = async (req: express.Request, res: express.Response) => {
-    try {
-      let rawSlug = req.params.slug || req.params[0] || '';
-      let slug = Array.isArray(rawSlug) ? rawSlug[0] : String(rawSlug);
-      if (!slug) {
-        return res.status(400).json({ error: "Slug is required" });
-      }
-
-      if (slug.endsWith('.json')) {
-        slug = slug.substring(0, slug.length - 5);
-      }
-
-      const itemKey = Object.keys(hostedStore).find(k => k === slug || hostedStore[k].slug === slug || hostedStore[k].id === slug);
-      let item = itemKey ? hostedStore[itemKey] : null;
-
-      if (!item) {
-        return res.status(404).json({
-          error: "API Endpoint not found",
-          requestedSlug: slug,
-          availableEndpoints: Object.values(hostedStore).map(h => `/api/public/${h.slug}.json`)
-        });
-      }
-
-      // Check if daily auto-update is due (>24h)
-      const now = new Date();
-      if (item.autoUpdateDaily && new Date(item.nextRefreshAt) <= now) {
-        console.log(`[API Access] Auto-update triggered for ${slug} on request`);
-        const refreshed = await refreshHostedItem(item.id);
-        if (refreshed) item = refreshed;
-      }
-
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Cache-Control", "public, max-age=3600, s-maxage=86400, stale-while-revalidate=86400");
-      res.json({
-        status: "ok",
-        slug: item.slug,
-        name: item.name,
-        description: item.description,
-        sourceUrl: item.sourceUrl,
-        sourceType: item.sourceType,
-        coverUrl: item.coverUrl,
-        trackCount: item.trackCount,
-        lastUpdated: item.lastUpdated,
-        nextRefreshAt: item.nextRefreshAt,
-        autoUpdateDaily: item.autoUpdateDaily,
-        hostedAt: `https://uvytunesspotify.vercel.app/api/${item.slug}.json`,
-        tracks: item.tracks
-      });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || "Failed to serve JSON endpoint" });
-    }
-  };
-
-  app.get("/api/public/:slug.json", handleServePublicJson);
-  app.get("/api/public/:slug", handleServePublicJson);
-  app.get("/api/hosted/:slug", handleServePublicJson);
-  app.get("/api/hosted/:slug.json", handleServePublicJson);
-
-  // Vercel Export endpoint to download / view Vercel deployment code
-  app.get("/api/vercel/export-code", (req, res) => {
-    const hostedList = Object.values(hostedStore);
-
-    const vercelJson = {
-      "version": 2,
-      "name": "uvytunesspotify-api",
-      "builds": [
-        { "src": "api/*.js", "use": "@vercel/node" }
-      ],
-      "routes": [
-        { "src": "/api/(.*).json", "dest": "/api/[slug].js?slug=$1" },
-        { "src": "/api/(.*)", "dest": "/api/[slug].js?slug=$1" }
-      ]
+    const newItem: HostedItem = {
+      id,
+      slug,
+      name,
+      description: description || `Served Spotify ${sourceType || 'playlist'}`,
+      sourceUrl,
+      sourceType: sourceType || (sourceUrl.includes('/section/') ? 'section' : 'playlist'),
+      trackCount: Array.isArray(tracks) ? tracks.length : 0,
+      coverUrl: coverUrl || null,
+      lastUpdated: now.toISOString(),
+      nextRefreshAt: next24h.toISOString(),
+      autoUpdateDaily: autoUpdateDaily !== false,
+      cookies: cookies || undefined,
+      tracks: Array.isArray(tracks) ? tracks : []
     };
 
-    const apiSlugJs = `// Vercel Serverless Function: api/[slug].js
+    hostedStore[slug] = newItem;
+    saveHostedStore();
+
+    res.json({
+      success: true,
+      message: `Playlist successfully published to API!`,
+      slug: newItem.slug,
+      item: newItem,
+      publicUrl: `/api/public/${newItem.slug}.json`,
+      directUrl: `/api/${newItem.slug}.json`,
+      vercelUrl: `https://uvytunesspotify.vercel.app/api/${newItem.slug}.json`
+    });
+  } catch (err: any) {
+    console.error("Error serving playlist to API:", err);
+    res.status(500).json({ error: err.message || "Failed to publish playlist to API" });
+  }
+});
+
+// Force Refresh Hosted Endpoint
+app.post("/api/hosted/refresh/:id", async (req, res) => {
+  try {
+    const updated = await refreshHostedItem(req.params.id);
+    if (!updated) {
+      return res.status(404).json({ error: "Hosted endpoint not found" });
+    }
+    res.json({ success: true, item: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to refresh endpoint" });
+  }
+});
+
+// Delete Hosted Endpoint
+app.delete("/api/hosted/:id", (req, res) => {
+  const idOrSlug = req.params.id;
+  const key = Object.keys(hostedStore).find(k => hostedStore[k].id === idOrSlug || hostedStore[k].slug === idOrSlug || k === idOrSlug);
+
+  if (key && hostedStore[key]) {
+    delete hostedStore[key];
+    saveHostedStore();
+    return res.json({ success: true, message: "Endpoint deleted" });
+  }
+  res.status(404).json({ error: "Endpoint not found" });
+});
+
+// Public GET Endpoint for fetching playlist JSON (Supports /api/public/:slug.json, /api/hosted/:slug.json, and /api/:slug.json)
+const handleServePublicJson = async (req: express.Request, res: express.Response) => {
+  try {
+    let rawSlug = req.params.slug || req.params[0] || '';
+    let slug = Array.isArray(rawSlug) ? rawSlug[0] : String(rawSlug);
+    if (!slug) {
+      return res.status(400).json({ error: "Slug is required" });
+    }
+
+    if (slug.endsWith('.json')) {
+      slug = slug.substring(0, slug.length - 5);
+    }
+
+    const itemKey = Object.keys(hostedStore).find(k => k === slug || hostedStore[k].slug === slug || hostedStore[k].id === slug);
+    let item = itemKey ? hostedStore[itemKey] : null;
+
+    if (!item) {
+      return res.status(404).json({
+        error: "API Endpoint not found",
+        requestedSlug: slug,
+        availableEndpoints: Object.values(hostedStore).map(h => `/api/public/${h.slug}.json`)
+      });
+    }
+
+    // Check if daily auto-update is due (>24h)
+    const now = new Date();
+    if (item.autoUpdateDaily && new Date(item.nextRefreshAt) <= now) {
+      console.log(`[API Access] Auto-update triggered for ${slug} on request`);
+      const refreshed = await refreshHostedItem(item.id);
+      if (refreshed) item = refreshed;
+    }
+
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Cache-Control", "public, max-age=3600, s-maxage=86400, stale-while-revalidate=86400");
+    res.json({
+      status: "ok",
+      slug: item.slug,
+      name: item.name,
+      description: item.description,
+      sourceUrl: item.sourceUrl,
+      sourceType: item.sourceType,
+      coverUrl: item.coverUrl,
+      trackCount: item.trackCount,
+      lastUpdated: item.lastUpdated,
+      nextRefreshAt: item.nextRefreshAt,
+      autoUpdateDaily: item.autoUpdateDaily,
+      hostedAt: `https://uvytunesspotify.vercel.app/api/${item.slug}.json`,
+      tracks: item.tracks
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || "Failed to serve JSON endpoint" });
+  }
+};
+
+app.get("/api/public/:slug.json", handleServePublicJson);
+app.get("/api/public/:slug", handleServePublicJson);
+app.get("/api/hosted/:slug", handleServePublicJson);
+app.get("/api/hosted/:slug.json", handleServePublicJson);
+
+// Vercel Export endpoint to download / view Vercel deployment code
+app.get("/api/vercel/export-code", (req, res) => {
+  const hostedList = Object.values(hostedStore);
+
+  const vercelJson = {
+    "version": 2,
+    "name": "uvytunesspotify-api",
+    "builds": [
+      { "src": "api/*.js", "use": "@vercel/node" }
+    ],
+    "routes": [
+      { "src": "/api/(.*).json", "dest": "/api/[slug].js?slug=$1" },
+      { "src": "/api/(.*)", "dest": "/api/[slug].js?slug=$1" }
+    ]
+  };
+
+  const apiSlugJs = `// Vercel Serverless Function: api/[slug].js
 // Serves fresh daily-updated Spotify & iTunes playlist JSONs for uvytunesspotify.vercel.app
 
 const HOSTED_PLAYLISTS = ${JSON.stringify(hostedList, null, 2)};
@@ -1371,7 +1379,7 @@ export default async function handler(req, res) {
 }
 `;
 
-    const readmeMd = `# uvytunesspotify Vercel API Server
+  const readmeMd = `# uvytunesspotify Vercel API Server
 
 Serves JSON playlist endpoints hosted at \`uvytunesspotify.vercel.app/api/:playlist-name.json\`.
 
@@ -1383,15 +1391,111 @@ Serves JSON playlist endpoints hosted at \`uvytunesspotify.vercel.app/api/:playl
    - \`https://uvytunesspotify.vercel.app/api/playlist-name.json\`
 `;
 
-    res.json({
-      "vercel.json": JSON.stringify(vercelJson, null, 2),
-      "api/[slug].js": apiSlugJs,
-      "README.md": readmeMd,
-      hostedCount: hostedList.length
-    });
+  res.json({
+    "vercel.json": JSON.stringify(vercelJson, null, 2),
+    "api/[slug].js": apiSlugJs,
+    "README.md": readmeMd,
+    hostedCount: hostedList.length
   });
+});
 
-  // Background Daily Auto-Refresh Job (runs every 1 hour)
+// API Route: Verify and inspect pasted Spotify cookies
+app.post("/api/cookies/verify", async (req, res) => {
+  try {
+    const cookieInput = req.body?.cookies || req.body?.sp_dc || req.body;
+    const verification = await verifySpotifyCookies(cookieInput);
+    res.json(verification);
+  } catch (err: any) {
+    res.status(500).json({ valid: false, error: err.message || "Failed to verify cookies" });
+  }
+});
+
+// Handler for scraping requests
+const handleScrapeRequest = async (req: express.Request, res: express.Response) => {
+  try {
+    const url = (req.body?.url || req.query.url) as string;
+    const country = (req.body?.country || req.query.country || "US") as string;
+    const cookies = req.body?.cookies || req.query.cookies || req.body?.sp_dc || req.query.sp_dc || req.headers['x-spotify-cookies'] || req.headers['x-spotify-sp-dc'] || undefined;
+
+    if (!url || (!url.includes("spotify.com") && !url.startsWith("spotify:"))) {
+      return res.status(400).json({ error: "Valid Spotify URL is required" });
+    }
+
+    console.log(`Scraping Spotify URL: ${url} (Country: ${country}, HasCookies: ${!!cookies})`);
+
+    // Check if it's a Spotify Section / Hub
+    if (url.includes("/section/") || url.includes("/hub/") || url.startsWith("spotify:section:") || url.startsWith("spotify:hub:")) {
+      const parts = url.split(/[/?#]/);
+      const sectionIdx = parts.findIndex(p => p === "section" || p === "hub");
+      const sectionId = sectionIdx !== -1 ? parts[sectionIdx + 1] : parts[parts.length - 1];
+
+      const sectionData = await scrapeSpotifySection(sectionId, country, 25, cookies);
+      return res.json(sectionData);
+    }
+    
+    // Otherwise scrape playlist / album / track
+    const rawData = await spotify.getData(url);
+    const enrichedData = await enrichSpotifyData(rawData, cookies);
+    
+    res.json(enrichedData);
+  } catch (err: any) {
+    console.error("Scraping error:", err);
+    res.status(500).json({ error: err.message || "Failed to scrape Spotify data" });
+  }
+};
+
+// API Routes for scraping (GET & POST supported)
+app.get("/api/scrape", handleScrapeRequest);
+app.post("/api/scrape", handleScrapeRequest);
+
+// Dedicated Section Scrape endpoint
+const handleSectionScrape = async (req: express.Request, res: express.Response) => {
+  try {
+    const sectionId = (req.body?.sectionId || req.body?.id || req.query.id || req.body?.url || req.query.url) as string;
+    const country = (req.body?.country || req.query.country || "US") as string;
+    const maxPlaylists = req.body?.maxPlaylists ? Number(req.body.maxPlaylists) : 50;
+    const cookies = req.body?.cookies || req.query.cookies || req.body?.sp_dc || req.query.sp_dc || req.headers['x-spotify-cookies'] || req.headers['x-spotify-sp-dc'] || undefined;
+    
+    if (!sectionId) {
+      return res.status(400).json({ error: "Section ID or URL is required" });
+    }
+
+    const sectionData = await scrapeSpotifySection(sectionId, country, maxPlaylists, cookies);
+    res.json(sectionData);
+  } catch (err: any) {
+    console.error("Section scraping error:", err);
+    res.status(500).json({ error: err.message || "Failed to scrape Spotify section" });
+  }
+};
+
+app.get("/api/scrape/section", handleSectionScrape);
+app.post("/api/scrape/section", handleSectionScrape);
+
+// Dedicated Canvas endpoint
+const handleCanvasRequest = async (req: express.Request, res: express.Response) => {
+  try {
+    const trackId = (req.body?.trackId || req.query.trackId || req.body?.id || req.query.id || req.body?.url || req.query.url) as string;
+    const cookies = req.body?.cookies || req.query.cookies || req.body?.sp_dc || req.query.sp_dc || req.headers['x-spotify-cookies'] || req.headers['x-spotify-sp-dc'] || undefined;
+    
+    if (!trackId) {
+      return res.status(400).json({ error: "trackId is required" });
+    }
+
+    const canvas = await fetchTrackCanvas(trackId, cookies);
+    res.json(canvas || { canvasUrl: null });
+  } catch (err: any) {
+    console.error("Canvas fetch error:", err);
+    res.status(500).json({ error: err.message || "Failed to fetch canvas" });
+  }
+};
+
+app.get("/api/canvas", handleCanvasRequest);
+app.post("/api/canvas", handleCanvasRequest);
+
+async function startServer() {
+  const PORT = 3000;
+
+  // Background Daily Auto-Refresh Job (runs every 1 hour on continuous servers)
   setInterval(async () => {
     try {
       const now = new Date();
@@ -1405,99 +1509,6 @@ Serves JSON playlist endpoints hosted at \`uvytunesspotify.vercel.app/api/:playl
       console.error("[Scheduled Daily Job Error]:", err.message);
     }
   }, 60 * 60 * 1000);
-
-  // API Route: Verify and inspect pasted Spotify cookies
-  app.post("/api/cookies/verify", async (req, res) => {
-    try {
-      const cookieInput = req.body?.cookies || req.body?.sp_dc || req.body;
-      const verification = await verifySpotifyCookies(cookieInput);
-      res.json(verification);
-    } catch (err: any) {
-      res.status(500).json({ valid: false, error: err.message || "Failed to verify cookies" });
-    }
-  });
-
-  // Handler for scraping requests
-  const handleScrapeRequest = async (req: express.Request, res: express.Response) => {
-    try {
-      const url = (req.body?.url || req.query.url) as string;
-      const country = (req.body?.country || req.query.country || "US") as string;
-      const cookies = req.body?.cookies || req.query.cookies || req.body?.sp_dc || req.query.sp_dc || req.headers['x-spotify-cookies'] || req.headers['x-spotify-sp-dc'] || undefined;
-
-      if (!url || (!url.includes("spotify.com") && !url.startsWith("spotify:"))) {
-        return res.status(400).json({ error: "Valid Spotify URL is required" });
-      }
-
-      console.log(`Scraping Spotify URL: ${url} (Country: ${country}, HasCookies: ${!!cookies})`);
-
-      // Check if it's a Spotify Section / Hub
-      if (url.includes("/section/") || url.includes("/hub/") || url.startsWith("spotify:section:") || url.startsWith("spotify:hub:")) {
-        const parts = url.split(/[/?#]/);
-        const sectionIdx = parts.findIndex(p => p === "section" || p === "hub");
-        const sectionId = sectionIdx !== -1 ? parts[sectionIdx + 1] : parts[parts.length - 1];
-
-        const sectionData = await scrapeSpotifySection(sectionId, country, 25, cookies);
-        return res.json(sectionData);
-      }
-      
-      // Otherwise scrape playlist / album / track
-      const rawData = await spotify.getData(url);
-      const enrichedData = await enrichSpotifyData(rawData, cookies);
-      
-      res.json(enrichedData);
-    } catch (err: any) {
-      console.error("Scraping error:", err);
-      res.status(500).json({ error: err.message || "Failed to scrape Spotify data" });
-    }
-  };
-
-  // API Routes for scraping (GET & POST supported)
-  app.get("/api/scrape", handleScrapeRequest);
-  app.post("/api/scrape", handleScrapeRequest);
-
-  // Dedicated Section Scrape endpoint
-  const handleSectionScrape = async (req: express.Request, res: express.Response) => {
-    try {
-      const sectionId = (req.body?.sectionId || req.body?.id || req.query.id || req.body?.url || req.query.url) as string;
-      const country = (req.body?.country || req.query.country || "US") as string;
-      const maxPlaylists = req.body?.maxPlaylists ? Number(req.body.maxPlaylists) : 50;
-      const cookies = req.body?.cookies || req.query.cookies || req.body?.sp_dc || req.query.sp_dc || req.headers['x-spotify-cookies'] || req.headers['x-spotify-sp-dc'] || undefined;
-      
-      if (!sectionId) {
-        return res.status(400).json({ error: "Section ID or URL is required" });
-      }
-
-      const sectionData = await scrapeSpotifySection(sectionId, country, maxPlaylists, cookies);
-      res.json(sectionData);
-    } catch (err: any) {
-      console.error("Section scraping error:", err);
-      res.status(500).json({ error: err.message || "Failed to scrape Spotify section" });
-    }
-  };
-
-  app.get("/api/scrape/section", handleSectionScrape);
-  app.post("/api/scrape/section", handleSectionScrape);
-
-  // Dedicated Canvas endpoint
-  const handleCanvasRequest = async (req: express.Request, res: express.Response) => {
-    try {
-      const trackId = (req.body?.trackId || req.query.trackId || req.body?.id || req.query.id || req.body?.url || req.query.url) as string;
-      const cookies = req.body?.cookies || req.query.cookies || req.body?.sp_dc || req.query.sp_dc || req.headers['x-spotify-cookies'] || req.headers['x-spotify-sp-dc'] || undefined;
-      
-      if (!trackId) {
-        return res.status(400).json({ error: "trackId is required" });
-      }
-
-      const canvas = await fetchTrackCanvas(trackId, cookies);
-      res.json(canvas || { canvasUrl: null });
-    } catch (err: any) {
-      console.error("Canvas fetch error:", err);
-      res.status(500).json({ error: err.message || "Failed to fetch canvas" });
-    }
-  };
-
-  app.get("/api/canvas", handleCanvasRequest);
-  app.post("/api/canvas", handleCanvasRequest);
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
@@ -1515,11 +1526,9 @@ Serves JSON playlist endpoints hosted at \`uvytunesspotify.vercel.app/api/:playl
     });
   }
 
-  if (process.env.VERCEL !== '1') {
-    app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Server running on http://localhost:${PORT}`);
-    });
-  }
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
 }
 
 if (process.env.VERCEL !== '1') {
