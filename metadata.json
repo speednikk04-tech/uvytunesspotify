@@ -1,0 +1,6 @@
+{
+  "name": "JSON Music Player",
+  "description": "A Spotify-style music player and metadata scraper for Spotify sections, nested playlists, albums, and iTunes RSS feeds.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

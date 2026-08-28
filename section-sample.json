@@ -1,0 +1,117 @@
+{
+  "title": "Charts & Playlists Hub (US)",
+  "subtitle": "Spotify Hub for US",
+  "playlistsCount": 22,
+  "playlists": [
+    {
+      "name": "Top Songs - USA",
+      "trackCount": 50,
+      "coverUrl": "https://charts-images.scdn.co/assets/locale_en/regional/weekly/region_us_default.jpg"
+    },
+    {
+      "name": "Top 50 - USA",
+      "trackCount": 50,
+      "coverUrl": "https://charts-images.scdn.co/assets/locale_en/regional/daily/region_us_default.jpg"
+    },
+    {
+      "name": "Top Songs - Global",
+      "trackCount": 50,
+      "coverUrl": "https://charts-images.scdn.co/assets/locale_en/regional/weekly/region_global_default.jpg"
+    },
+    {
+      "name": "Top 50 - Global",
+      "trackCount": 50,
+      "coverUrl": "https://charts-images.scdn.co/assets/locale_en/regional/daily/region_global_default.jpg"
+    },
+    {
+      "name": "you seem pretty sad for a girl so in love",
+      "trackCount": 13,
+      "coverUrl": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/1d/1b/f9/1d1bf9b1-44c6-9a6c-6ffb-c158488c06ce/26UMGIM39303.rgb.jpg/600x600bb.jpg"
+    },
+    {
+      "name": "I’m The Problem",
+      "trackCount": 37,
+      "coverUrl": null
+    },
+    {
+      "name": "petal",
+      "trackCount": 12,
+      "coverUrl": null
+    },
+    {
+      "name": "10 Hours of Continuous Rain Sounds for Sleeping",
+      "trackCount": 100,
+      "coverUrl": null
+    },
+    {
+      "name": "ICEMAN",
+      "trackCount": 18,
+      "coverUrl": null
+    },
+    {
+      "name": "The Great Divide: The Last Of The Bugs",
+      "trackCount": 21,
+      "coverUrl": null
+    },
+    {
+      "name": "DeBÍ TiRAR MáS FOToS",
+      "trackCount": 17,
+      "coverUrl": null
+    },
+    {
+      "name": "Dandelion",
+      "trackCount": 18,
+      "coverUrl": null
+    },
+    {
+      "name": "Sweet Boy",
+      "trackCount": 16,
+      "coverUrl": "https://is1-ssl.mzstatic.com/image/thumb/Music221/v4/d0/06/1f/d0061f04-bcae-f9a1-8126-830c04fa32db/196871971188.jpg/600x600bb.jpg"
+    },
+    {
+      "name": "Jolene (Expanded Edition)",
+      "trackCount": 14,
+      "coverUrl": "https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/0b/f8/1e/0bf81e88-de6e-aba3-9fd4-e7407bfbcc31/886445438048.jpg/600x600bb.jpg"
+    },
+    {
+      "name": "COWBOY CARTER",
+      "trackCount": 27,
+      "coverUrl": null
+    },
+    {
+      "name": "Just Between You and Me",
+      "trackCount": 12,
+      "coverUrl": null
+    },
+    {
+      "name": "Rescue Story",
+      "trackCount": 10,
+      "coverUrl": null
+    },
+    {
+      "name": "You Can't Make Old Friends",
+      "trackCount": 11,
+      "coverUrl": null
+    },
+    {
+      "name": "serena joy",
+      "trackCount": 1,
+      "coverUrl": null
+    },
+    {
+      "name": "Chet Atkins - The Master And His Music",
+      "trackCount": 16,
+      "coverUrl": null
+    },
+    {
+      "name": "Time Well Wasted",
+      "trackCount": 21,
+      "coverUrl": null
+    },
+    {
+      "name": "August 26",
+      "trackCount": 10,
+      "coverUrl": null
+    }
+  ]
+}

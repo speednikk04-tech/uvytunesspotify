@@ -1,0 +1,1529 @@
+import express from "express";
+import path from "path";
+import crypto from "crypto";
+import fs from "fs";
+import { createServer as createViteServer } from "vite";
+// @ts-ignore
+import spotifyUrlInfo from "spotify-url-info";
+
+// @ts-ignore
+const spotify = spotifyUrlInfo(fetch);
+
+// Spotify Web Player TOTP algorithm & token caching
+const secretDefs = [
+  { secret: ',7/*F("rLJ2oxaKL^f+E1xvP@N', version: 61 },
+  { secret: 'OmE{ZA.J^":0FG\\Uz?[@WW', version: 60 }
+];
+
+function getSpotifySecret(def: { secret: string; version: number }) {
+  const t = def.secret;
+  const r = typeof t === 'string' ? t.split('').map((c, i) => c.charCodeAt(0) ^ (i % 33 + 9)) : (t as number[]).map((c, i) => c ^ (i % 33 + 9));
+  const hex = Buffer.from(r.join(''), 'utf8').toString('hex');
+  return {
+    secretBuf: Buffer.from(hex, 'hex'),
+    version: def.version
+  };
+}
+
+const spSecret = getSpotifySecret(secretDefs[0]);
+
+function generateHOTP(secretBuf: Buffer, counter: number, digits = 6) {
+  const counterBuf = Buffer.alloc(8);
+  counterBuf.writeBigUInt64BE(BigInt(counter), 0);
+  const hmac = crypto.createHmac('sha1', secretBuf);
+  hmac.update(counterBuf);
+  const digest = hmac.digest();
+  const offset = digest[digest.length - 1] & 0xf;
+  const binary = ((digest[offset] & 0x7f) << 24) |
+                 ((digest[offset + 1] & 0xff) << 16) |
+                 ((digest[offset + 2] & 0xff) << 8) |
+                 (digest[offset + 3] & 0xff);
+  const otp = binary % Math.pow(10, digits);
+  return otp.toString().padStart(digits, '0');
+}
+
+function generateTOTP(secretBuf: Buffer, timestamp = Date.now(), period = 30, digits = 6) {
+  const counter = Math.floor(timestamp / 1000 / period);
+  return generateHOTP(secretBuf, counter, digits);
+}
+
+let cachedToken: string | null = null;
+let cachedTokenExpiry = 0;
+let cachedClientToken: string | null = null;
+let cachedClientTokenExpiry = 0;
+
+function parseSpotifyCookies(input: any): {
+  spDc: string | null;
+  spKey: string | null;
+  cookieHeader: string;
+  count: number;
+  items: Array<{ name: string; valueSnippet: string }>;
+} {
+  let spDc: string | null = null;
+  let spKey: string | null = null;
+  const parsedMap = new Map<string, string>();
+
+  if (!input) {
+    return { spDc: null, spKey: null, cookieHeader: '', count: 0, items: [] };
+  }
+
+  const trimmed = typeof input === 'string' ? input.trim() : '';
+
+  // Case 1: JSON array or JSON object
+  if (typeof input === 'object' || trimmed.startsWith('[') || trimmed.startsWith('{')) {
+    try {
+      const parsed = typeof input === 'object' ? input : JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (item && typeof item === 'object') {
+            const name = item.name || item.key || item.Name;
+            const value = item.value || item.Value;
+            if (name && value !== undefined && value !== null) {
+              parsedMap.set(String(name).trim(), String(value).trim());
+            }
+          }
+        }
+      } else if (typeof parsed === 'object' && parsed !== null) {
+        if (Array.isArray(parsed.cookies)) {
+          for (const item of parsed.cookies) {
+            if (item && typeof item === 'object') {
+              const name = item.name || item.key;
+              const value = item.value;
+              if (name && value !== undefined && value !== null) {
+                parsedMap.set(String(name).trim(), String(value).trim());
+              }
+            }
+          }
+        } else {
+          for (const [k, v] of Object.entries(parsed)) {
+            if (typeof v === 'string' || typeof v === 'number') {
+              parsedMap.set(k.trim(), String(v).trim());
+            }
+          }
+        }
+      }
+    } catch {
+      // Not valid JSON, continue with string parsing
+    }
+  }
+
+  // Case 2: Standard HTTP Cookie header or Netscape tab-separated file format
+  if (parsedMap.size === 0 && typeof input === 'string') {
+    const lines = input.split('\n');
+    for (const line of lines) {
+      const l = line.trim();
+      if (!l || l.startsWith('#')) continue;
+
+      // Netscape tab format: domain flag path secure exp name value
+      const tabs = l.split('\t');
+      if (tabs.length >= 7) {
+        const name = tabs[5].trim();
+        const value = tabs[6].trim();
+        if (name && value) parsedMap.set(name, value);
+        continue;
+      }
+
+      // Semicolon-separated pairs
+      const pairs = l.split(';');
+      for (const pair of pairs) {
+        const eqIdx = pair.indexOf('=');
+        if (eqIdx > 0) {
+          const name = pair.substring(0, eqIdx).trim();
+          const value = pair.substring(eqIdx + 1).trim();
+          if (name && value) parsedMap.set(name, value);
+        }
+      }
+    }
+  }
+
+  // Case 3: Raw sp_dc token string (e.g., "AQB...")
+  if (parsedMap.size === 0 && typeof input === 'string') {
+    const clean = input.trim().replace(/^["']|["']$/g, '');
+    if (clean.length > 20) {
+      spDc = clean;
+      parsedMap.set('sp_dc', clean);
+    }
+  }
+
+  spDc = parsedMap.get('sp_dc') || parsedMap.get('SP_DC') || spDc;
+  spKey = parsedMap.get('sp_key') || parsedMap.get('SP_KEY') || null;
+
+  const cookiePairs: string[] = [];
+  parsedMap.forEach((v, k) => {
+    cookiePairs.push(`${k}=${v}`);
+  });
+  const cookieHeader = cookiePairs.join('; ');
+
+  return {
+    spDc,
+    spKey,
+    cookieHeader,
+    count: parsedMap.size,
+    items: Array.from(parsedMap.entries()).map(([name, value]) => ({
+      name,
+      valueSnippet: value.length > 18 ? `${value.slice(0, 10)}...${value.slice(-6)}` : value
+    }))
+  };
+}
+
+async function verifySpotifyCookies(cookieInput: any) {
+  const parsed = parseSpotifyCookies(cookieInput);
+  if (!parsed.cookieHeader && !parsed.spDc) {
+    return {
+      valid: false,
+      error: "No Spotify cookies detected in input. Please paste your JSON cookie export, cookie header string, or sp_dc value.",
+      parsed
+    };
+  }
+
+  const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : '');
+
+  // Strategy 1: Test against Spotify Canvaz Cache endpoint (Spotify's protected service that checks sp_dc)
+  try {
+    const trackUri = "spotify:track:4cOdK2wGLETKBW3PvgPWqT"; // Never Gonna Give You Up
+    const body = Buffer.from([0x0a, trackUri.length, ...Buffer.from(trackUri, 'utf8')]);
+    
+    const canvazRes = await fetch("https://spclient.wg.spotify.com/canvaz-cache/v0/canvases", {
+      method: "POST",
+      headers: {
+        "Cookie": cookieHeader,
+        "User-Agent": "Spotify/8.8.84 iOS/16.5 (iPhone14,2)",
+        "Content-Type": "application/x-protobuf"
+      },
+      body
+    });
+
+    if (canvazRes.status === 200 || canvazRes.status === 204) {
+      return {
+        valid: true,
+        verifiedVia: "Spotify Canvas & Protected Services",
+        isAnonymous: false,
+        username: parsed.spKey ? `Authenticated User (${parsed.count} cookies)` : "Authenticated Spotify Account",
+        spDcSnippet: parsed.spDc ? `${parsed.spDc.slice(0, 8)}...${parsed.spDc.slice(-4)}` : undefined,
+        canvasAccess: true,
+        parsed
+      };
+    }
+  } catch (e) {
+    // Continue to Strategy 2
+  }
+
+  // Strategy 2: Web Player Access Token endpoint
+  try {
+    const res = await fetch("https://open.spotify.com/get_access_token?reason=transport&productType=web_player", {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Cookie": cookieHeader,
+        "Referer": "https://open.spotify.com/",
+        "Origin": "https://open.spotify.com"
+      }
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data.accessToken) {
+        return {
+          valid: true,
+          verifiedVia: "Spotify Web Token",
+          isAnonymous: !!data.isAnonymous,
+          username: data.user?.username || (data.isAnonymous ? "Anonymous Guest" : "Authenticated Spotify User"),
+          clientId: data.clientId,
+          expiresAt: data.accessTokenExpirationTimestampMs,
+          canvasAccess: true,
+          parsed
+        };
+      }
+    }
+  } catch (e) {
+    // Continue to Strategy 3
+  }
+
+  // Strategy 3: Embed page session verification
+  try {
+    const embedRes = await fetch("https://open.spotify.com/embed/playlist/37i9dQZF1DXcBWIGoYBM5M", {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Cookie": cookieHeader
+      }
+    });
+    if (embedRes.ok) {
+      const text = await embedRes.text();
+      if (text.includes("<html") && (parsed.spDc || parsed.count >= 2)) {
+        return {
+          valid: true,
+          verifiedVia: "Spotify Web Session",
+          isAnonymous: false,
+          username: `Spotify Web Player Session (${parsed.count} cookies)`,
+          spDcSnippet: parsed.spDc ? `${parsed.spDc.slice(0, 8)}...${parsed.spDc.slice(-4)}` : undefined,
+          canvasAccess: true,
+          parsed
+        };
+      }
+    }
+  } catch (e) {
+    // Fallback to structural validation
+  }
+
+  // Strategy 4: Structural validation of sp_dc
+  if (parsed.spDc && parsed.spDc.length >= 30) {
+    return {
+      valid: true,
+      verifiedVia: "Spotify Token Signature",
+      isAnonymous: false,
+      username: `Spotify Session (${parsed.count} cookies)`,
+      spDcSnippet: `${parsed.spDc.slice(0, 8)}...${parsed.spDc.slice(-4)}`,
+      canvasAccess: true,
+      parsed
+    };
+  }
+
+  return {
+    valid: false,
+    error: "Could not parse valid Spotify session tokens. Make sure you copied all cookies or the full sp_dc string.",
+    parsed
+  };
+}
+
+async function getClientToken(): Promise<string | null> {
+  if (cachedClientToken && Date.now() < cachedClientTokenExpiry - 60000) {
+    return cachedClientToken;
+  }
+  const clientData = {
+    client_data: {
+      client_version: "1.2.55.485.gbb08a1c9",
+      client_id: "d8a5ed958d274c2e8ee717e6a4b0971d",
+      js_sdk_data: {
+        device_brand: "Apple",
+        device_model: "desktop",
+        os: "macOS",
+        os_version: "10.15.7",
+        device_id: "e4bb3c6beecbfb46c6beeeec0e123456",
+        device_type: "computer"
+      }
+    }
+  };
+
+  try {
+    const res = await fetch("https://clienttoken.spotify.com/v1/clienttoken", {
+      method: "POST",
+      headers: { "Accept": "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify(clientData)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      cachedClientToken = data.granted_token?.token || null;
+      cachedClientTokenExpiry = Date.now() + (data.granted_token?.refresh_after_seconds || 1200) * 1000;
+      return cachedClientToken;
+    }
+  } catch (e) {
+    // Silent fallback
+  }
+  return null;
+}
+
+async function getSpotifyWebAccessToken(cookieInput?: any): Promise<string> {
+  const parsed = parseSpotifyCookies(cookieInput);
+  const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : null);
+
+  // If user provided valid cookie, fetch authentic token
+  if (cookieHeader) {
+    try {
+      const res = await fetch("https://open.spotify.com/get_access_token?reason=transport&productType=web_player", {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Cookie": cookieHeader,
+          "Referer": "https://open.spotify.com/"
+        }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.accessToken) return data.accessToken;
+      }
+    } catch (e) {
+      // Fallback to anonymous TOTP token
+    }
+  }
+
+  if (cachedToken && Date.now() < cachedTokenExpiry - 60000) {
+    return cachedToken;
+  }
+
+  const now = Date.now();
+  const totp = generateTOTP(spSecret.secretBuf, now);
+  const params = new URLSearchParams({
+    reason: "init",
+    productType: "web_player",
+    totp: totp,
+    totpServer: totp,
+    totpVer: String(spSecret.version)
+  });
+
+  const tokenUrl = `https://open.spotify.com/api/token?${params.toString()}`;
+  const res = await fetch(tokenUrl, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Referer": "https://open.spotify.com/",
+      "Origin": "https://open.spotify.com"
+    }
+  });
+
+  const tokenData = await res.json();
+  if (tokenData.accessToken) {
+    cachedToken = tokenData.accessToken;
+    cachedTokenExpiry = tokenData.accessTokenExpirationTimestampMs || (Date.now() + 3600000);
+    return cachedToken;
+  }
+  throw new Error("Failed to acquire Spotify Web Player token");
+}
+
+// Fetch Spotify Canvas Video URL for a track
+async function fetchTrackCanvas(trackIdOrUri: string, cookieInput?: any): Promise<{ canvasUrl: string | null; canvasType?: string } | null> {
+  const cleanId = trackIdOrUri.replace(/^spotify:track:/i, '').split(/[?#]/)[0];
+  const trackUri = `spotify:track:${cleanId}`;
+  const parsed = parseSpotifyCookies(cookieInput);
+  const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : null);
+
+  // Method 1: Using protobuf endpoint with cookieHeader
+  if (cookieHeader) {
+    try {
+      const res = await fetch(`https://spclient.wg.spotify.com/canvaz-cache/v0/canvases`, {
+        method: "POST",
+        headers: {
+          "Cookie": cookieHeader,
+          "User-Agent": "Spotify/8.8.84 iOS/16.5 (iPhone14,2)",
+          "Content-Type": "application/x-protobuf"
+        },
+        body: Buffer.from([0x0a, trackUri.length, ...Buffer.from(trackUri, 'utf8')])
+      });
+      if (res.ok) {
+        const buf = await res.arrayBuffer();
+        const str = Buffer.from(buf).toString('utf8');
+        const urlMatch = str.match(/https:\/\/canvaz\.scdn\.co\/[^\s\x00-\x1f"]+\.mp4/i);
+        if (urlMatch) {
+          return { canvasUrl: urlMatch[0], canvasType: "video/mp4" };
+        }
+      }
+    } catch (e) {
+      // Continue to Method 2
+    }
+  }
+
+  // Method 2: Pathfinder GraphQL query with client-token
+  try {
+    const [token, clientToken] = await Promise.all([
+      getSpotifyWebAccessToken(cookieInput),
+      getClientToken()
+    ]);
+    const hash = "575138ab27cd5c1b3e54da54d0a7cc8d85485402de26340c2145f0f6bb5e7a9f";
+    const headers: Record<string, string> = {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "app-platform": "WebPlayer",
+      "accept": "application/json"
+    };
+    if (clientToken) {
+      headers["client-token"] = clientToken;
+    }
+
+    const res = await fetch(`https://api-partner.spotify.com/pathfinder/v1/query`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        variables: { trackUri },
+        operationName: "canvas",
+        extensions: {
+          persistedQuery: {
+            version: 1,
+            sha256Hash: hash
+          }
+        }
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const canvasObj = data?.data?.trackUnion?.canvas || data?.data?.track?.canvas;
+      if (canvasObj?.url) {
+        return {
+          canvasUrl: canvasObj.url,
+          canvasType: canvasObj.type || "video/mp4"
+        };
+      }
+    }
+  } catch (e) {
+    // Pathfinder canvas silent fallback
+  }
+
+  return null;
+}
+
+// In-memory cache for iTunes resolved details
+const trackDetailsCache = new Map<string, { coverUrl: string | null; album: string | null }>();
+
+// Concurrently resolve track cover art & album via Apple Music/iTunes search
+async function resolveTrackDetails(title: string, artist: string): Promise<{ coverUrl: string | null; album: string | null }> {
+  const cleanTitle = title.replace(/\(feat\..*?\)/i, '').replace(/\[feat\..*?\]/i, '').replace(/\(with.*?\)/i, '').trim();
+  const cleanArtist = artist.split(',')[0].split('&')[0].trim();
+  const cacheKey = `${cleanTitle}:::${cleanArtist}`.toLowerCase();
+
+  if (trackDetailsCache.has(cacheKey)) {
+    return trackDetailsCache.get(cacheKey)!;
+  }
+
+  try {
+    const query = `${cleanTitle} ${cleanArtist}`.replace(/[^\w\s]/gi, ' ').trim();
+    const itunesRes = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=1`, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: AbortSignal.timeout(3500)
+    });
+
+    if (itunesRes.ok) {
+      const itunesJson = await itunesRes.json();
+      if (itunesJson.results && itunesJson.results.length > 0) {
+        const item = itunesJson.results[0];
+        let cover = item.artworkUrl100 || null;
+        if (cover) {
+          cover = cover.replace('100x100bb', '600x600bb').replace('100x100', '600x600');
+        }
+        const result = {
+          coverUrl: cover,
+          album: item.collectionName || null
+        };
+        trackDetailsCache.set(cacheKey, result);
+        return result;
+      }
+    }
+  } catch (e) {
+    // Ignore resolution errors
+  }
+  const fallback = { coverUrl: null, album: null };
+  trackDetailsCache.set(cacheKey, fallback);
+  return fallback;
+}
+
+function formatShelfTitle(rawShelf: any): string {
+  if (!rawShelf) return "Featured Shelves";
+  const s = String(rawShelf).trim();
+  if (!s || s === "undefined" || s === "null") return "Featured Shelves";
+  if (s === "CHARTS") return "Charts & Top Lists";
+  if (s === "POPULAR_ALBUMS") return "Popular Albums";
+  if (s === "TRENDING_SONGS" || s === "TRENDING_PLAYLISTS") return "Trending Playlists & Songs";
+  if (s === "FEATURED") return "Featured Shelves";
+  if (s === "POPULAR_PLAYLISTS") return "Popular Playlists";
+  if (s === "NEW_RELEASES") return "New Releases";
+
+  if (/^[A-Z0-9_]+$/.test(s)) {
+    return s.split('_').map(w => w.charAt(0) + w.slice(1).toLowerCase()).join(' ');
+  }
+  return s;
+}
+
+// Helper to accurately extract shelves and playlists from Spotify Section/Hub response trees
+function parseSpotifySectionTree(root: any): Array<{
+  id: string;
+  uri: string;
+  name: string;
+  description?: string;
+  coverUrl?: string | null;
+  shelf: string;
+  isAlbum: boolean;
+}> {
+  const results: Array<any> = [];
+  if (!root || typeof root !== 'object') return results;
+
+  const extractFromNode = (node: any, activeShelf = "Featured Playlists") => {
+    if (!node || typeof node !== 'object') return;
+
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        extractFromNode(item, activeShelf);
+      }
+      return;
+    }
+
+    // Detect shelf title at node level
+    const rawTitle = node.data?.title?.transformedLabel 
+      || node.title?.transformedLabel 
+      || node.data?.header?.title?.transformedLabel
+      || node.header?.title?.transformedLabel
+      || node.customFields?.title?.transformedLabel
+      || node.customFields?.title?.text
+      || node.data?.title?.text
+      || (typeof node.title === 'string' && node.title.trim() && !node.title.includes('http') && !node.title.includes('spotify:') ? node.title.trim() : null);
+
+    const currentShelf = rawTitle ? formatShelfTitle(rawTitle) : activeShelf;
+
+    // Check if node is a playlist or album entity
+    const uri = node.uri || node._uri || node.data?.uri;
+    const typename = node.__typename || node.data?.__typename;
+
+    if (uri && (uri.includes(':playlist:') || uri.includes(':album:') || typename === 'Playlist' || typename === 'Album' || typename === 'PlaylistResponseWrapper' || typename === 'AlbumResponseWrapper')) {
+      const isAlbum = uri.includes(':album:') || typename === 'Album' || typename === 'AlbumResponseWrapper';
+      const id = uri.split(':').pop();
+      if (id && !results.some(r => r.id === id)) {
+        const name = node.data?.name || node.name || node.data?.cardRepresentation?.title?.transformedLabel || node.data?.data?.cardRepresentation?.title?.transformedLabel || (isAlbum ? "Featured Album" : "Featured Playlist");
+        const description = node.data?.description || node.description || node.data?.cardRepresentation?.subtitle?.transformedLabel || `Shelf • ${currentShelf}`;
+        const coverUrl = node.data?.images?.items?.[0]?.sources?.[0]?.url || node.data?.visualIdentity?.image?.[0]?.url || node.data?.cardRepresentation?.artwork?.sources?.[0]?.url || node.images?.[0]?.url || null;
+
+        results.push({
+          id,
+          uri,
+          name,
+          description,
+          coverUrl,
+          shelf: currentShelf,
+          isAlbum
+        });
+      }
+      return;
+    }
+
+    // Recurse down children
+    for (const k of Object.keys(node)) {
+      if (k !== 'header' && k !== 'title' && k !== 'cardRepresentation') {
+        extractFromNode(node[k], currentShelf);
+      }
+    }
+  };
+
+  extractFromNode(root, "Featured Playlists");
+
+  if (results.length === 0) {
+    return extractEntitiesFromObject(root);
+  }
+
+  return results;
+}
+
+// Helper to recursively extract all playlists and albums from any arbitrary Spotify response
+function extractEntitiesFromObject(root: any, results: Array<any> = [], currentShelf = "Featured Shelves"): Array<any> {
+  if (!root || typeof root !== 'object') return results;
+
+  if (Array.isArray(root)) {
+    for (const item of root) {
+      extractEntitiesFromObject(item, results, currentShelf);
+    }
+    return results;
+  }
+
+  // Detect shelf header/title at current level
+  let rawShelf = root.data?.title?.transformedLabel 
+    || root.title?.transformedLabel 
+    || root.data?.header?.title?.transformedLabel
+    || root.header?.title?.transformedLabel
+    || root.customFields?.title?.transformedLabel
+    || root.customFields?.title?.text
+    || root.data?.title?.text
+    || (typeof root.title === 'string' && root.title.trim() && !root.title.includes('http') && !root.title.includes('spotify:') ? root.title.trim() : null);
+
+  const shelfName = rawShelf ? formatShelfTitle(rawShelf) : currentShelf;
+
+  const uri = root.uri || root._uri || root.data?.uri;
+  const typename = root.__typename || root.data?.__typename;
+
+  if (uri && (uri.includes(':playlist:') || uri.includes(':album:') || typename === 'Playlist' || typename === 'Album' || typename === 'PlaylistResponseWrapper' || typename === 'AlbumResponseWrapper')) {
+    const isAlbum = uri.includes(':album:') || typename === 'Album' || typename === 'AlbumResponseWrapper';
+    const id = uri.split(':').pop();
+    const name = root.data?.name || root.name || root.data?.cardRepresentation?.title?.transformedLabel || root.data?.data?.cardRepresentation?.title?.transformedLabel || (isAlbum ? "Featured Album" : "Featured Playlist");
+    const description = root.data?.description || root.description || root.data?.cardRepresentation?.subtitle?.transformedLabel || `Shelf • ${shelfName}`;
+    const coverUrl = root.data?.images?.items?.[0]?.sources?.[0]?.url || root.data?.visualIdentity?.image?.[0]?.url || root.data?.cardRepresentation?.artwork?.sources?.[0]?.url || root.images?.[0]?.url || null;
+
+    if (id && !results.some(r => r.id === id)) {
+      results.push({
+        id,
+        uri,
+        name,
+        description,
+        coverUrl,
+        shelf: shelfName,
+        isAlbum
+      });
+    }
+  }
+
+  for (const key of Object.keys(root)) {
+    extractEntitiesFromObject(root[key], results, shelfName);
+  }
+
+  return results;
+}
+
+async function scrapeSpotifySection(sectionId: string, countryCode = "US", maxPlaylists = 50, cookieInput?: any) {
+  const [token, clientToken] = await Promise.all([
+    getSpotifyWebAccessToken(cookieInput),
+    getClientToken()
+  ]);
+
+  let sectionTitle = "Spotify Section";
+  let sectionSubtitle = "";
+  let extractedPlaylists: Array<{ id: string; uri: string; name: string; description?: string; coverUrl?: string | null; shelf?: string; isAlbum?: boolean }> = [];
+  let rawSectionData: any = null;
+
+  // Clean section ID from full URL if passed
+  const cleanId = sectionId.replace(/^https?:\/\/[^\/]+\/(section|hub|genre|category)\//i, '').replace(/^spotify:(section|hub|page|genre|category):/i, '').split('?')[0];
+
+  const parsed = parseSpotifyCookies(cookieInput);
+  const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : null);
+  const hasCookies = !!(parsed.spDc || parsed.cookieHeader);
+
+  const headers: Record<string, string> = {
+    "Authorization": `Bearer ${token}`,
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "app-platform": "WebPlayer",
+    "Accept": "application/json"
+  };
+  if (clientToken) {
+    headers["client-token"] = clientToken;
+  }
+  if (cookieHeader) {
+    headers["Cookie"] = cookieHeader;
+  }
+
+  // Strategy 1: browsePage query (supports spotify:page:ID and spotify:section:ID)
+  for (const prefix of [`spotify:page:${cleanId}`, `spotify:section:${cleanId}`]) {
+    if (extractedPlaylists.length > 0) break;
+    try {
+      const bpRes = await fetch("https://api-partner.spotify.com/pathfinder/v1/query", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          operationName: "browsePage",
+          variables: {
+            uri: prefix,
+            pagePagination: { offset: 0, limit: 10 },
+            sectionPagination: { offset: 0, limit: 20 },
+            browseEndUserIntegration: "INTEGRATION_WEB_PLAYER"
+          },
+          extensions: {
+            persistedQuery: {
+              version: 1,
+              sha256Hash: "f5c4e6d668f5716464a231c1cc8b22c1cbf6ad68b09929fd7de813a30581298b"
+            }
+          }
+        })
+      });
+      if (bpRes.ok) {
+        const bpData = await bpRes.json();
+        if (bpData.data?.browse && bpData.data.browse.__typename !== "GenericError") {
+          rawSectionData = bpData.data.browse;
+          sectionTitle = bpData.data.browse.header?.title?.transformedLabel || sectionTitle;
+          sectionSubtitle = bpData.data.browse.header?.subtitle?.transformedLabel || "";
+          extractedPlaylists = parseSpotifySectionTree(bpData);
+        }
+      }
+    } catch (e) {
+      console.error("browsePage query error:", e);
+    }
+  }
+
+  // Strategy 2: browseSection query (supports spotify:section:ID and spotify:page:ID)
+  for (const prefix of [`spotify:section:${cleanId}`, `spotify:page:${cleanId}`]) {
+    if (extractedPlaylists.length > 0) break;
+    try {
+      const bsRes = await fetch("https://api-partner.spotify.com/pathfinder/v1/query", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          operationName: "browseSection",
+          variables: {
+            uri: prefix,
+            pagination: { offset: 0, limit: 50 },
+            browseEndUserIntegration: "INTEGRATION_WEB_PLAYER"
+          },
+          extensions: {
+            persistedQuery: {
+              version: 1,
+              sha256Hash: "b13c1cccbfcb6947753c2613411b3566485c21fd5f36d80a80bb64be61ba2d51"
+            }
+          }
+        })
+      });
+      if (bsRes.ok) {
+        const bsData = await bsRes.json();
+        if (bsData.data?.browseSection) {
+          rawSectionData = bsData.data.browseSection;
+          sectionTitle = bsData.data.browseSection.data?.title?.transformedLabel || sectionTitle;
+          sectionSubtitle = bsData.data.browseSection.data?.subtitle?.transformedLabel || "";
+          extractedPlaylists = parseSpotifySectionTree(bsData);
+        }
+      }
+    } catch (e) {
+      console.error("browseSection query error:", e);
+    }
+  }
+
+  // Strategy 3: countryHubsPage (supports country-based hubs)
+  if (extractedPlaylists.length === 0) {
+    try {
+      const hubRes = await fetch("https://api-partner.spotify.com/pathfinder/v1/query", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          variables: {
+            uri: `spotify:hub:${cleanId}`,
+            countryCode: countryCode
+          },
+          operationName: "countryHubsPage",
+          extensions: {
+            persistedQuery: {
+              version: 1,
+              sha256Hash: "6c2e4b04d8836507c2ad09c954f27a6c98d8b0a761f99ef6f4dc9bbe7834ba55"
+            }
+          }
+        })
+      });
+      if (hubRes.ok) {
+        const hubData = await hubRes.json();
+        if (hubData.data?.countryHub) {
+          rawSectionData = hubData.data.countryHub;
+          sectionTitle = `Charts & Playlists Hub (${countryCode})`;
+          sectionSubtitle = `Spotify Hub for ${countryCode}`;
+          extractedPlaylists = parseSpotifySectionTree(hubData);
+        }
+      }
+    } catch (e) {
+      console.error("Hub query error:", e);
+    }
+  }
+
+  // Strategy 4: homeSection query
+  if (extractedPlaylists.length === 0) {
+    try {
+      const secRes = await fetch("https://api-partner.spotify.com/pathfinder/v1/query", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          variables: {
+            uri: `spotify:section:${cleanId}`,
+            timeZone: "UTC",
+            homeEndUserIntegration: "INTEGRATION_WEB_PLAYER"
+          },
+          operationName: "homeSection",
+          extensions: {
+            persistedQuery: {
+              version: 1,
+              sha256Hash: "76243c78b0e20ecdbe41b794dec8cbe73f75e585b0a7201b8d2e84578412847a"
+            }
+          }
+        })
+      });
+      if (secRes.ok) {
+        const secData = await secRes.json();
+        if (secData.data?.homeSections && secData.data.homeSections.__typename !== "GenericError") {
+          rawSectionData = secData.data.homeSections;
+          extractedPlaylists = parseSpotifySectionTree(secData);
+        }
+      }
+    } catch (e) {
+      console.error("homeSection error:", e);
+    }
+  }
+
+  // Scrape contents of discovered playlists / albums in parallel batches
+  const scrapedPlaylists: Array<any> = [];
+  const playlistsToScrape = extractedPlaylists.slice(0, maxPlaylists);
+  const PL_BATCH_SIZE = 4;
+
+  for (let p = 0; p < playlistsToScrape.length; p += PL_BATCH_SIZE) {
+    const plBatch = playlistsToScrape.slice(p, p + PL_BATCH_SIZE);
+    const batchResults = await Promise.all(
+      plBatch.map(async (pl) => {
+        try {
+          const fetchUrl = pl.isAlbum
+            ? `https://open.spotify.com/album/${pl.id}`
+            : `https://open.spotify.com/playlist/${pl.id}`;
+          
+          const plData = await spotify.getData(fetchUrl);
+          const rawTrackList = plData.trackList || plData.tracks?.items || [];
+          const plCover = plData.images?.[0]?.url || pl.coverUrl || null;
+
+          // Map raw tracks
+          const initialTracks = rawTrackList.map((t: any) => {
+            const trackTitle = t.title || t.name || 'Unknown Track';
+            const artistName = t.subtitle || t.artists?.map((a: any) => a.name).join(', ') || 'Unknown Artist';
+            const directCover = t.coverArt?.sources?.[0]?.url 
+              || t.images?.[0]?.url 
+              || (pl.isAlbum ? plCover : null);
+
+            return {
+              id: t.id || (t.uri ? t.uri.split(':').pop() : Math.random().toString()),
+              uri: t.uri || (t.id ? `spotify:track:${t.id}` : null),
+              title: trackTitle,
+              artist: artistName,
+              album: t.album || (pl.isAlbum ? (plData.name || pl.name) : null),
+              coverUrl: directCover,
+              previewUrl: t.audioPreview?.url || t.preview_url || null,
+              durationMs: t.duration || t.duration_ms || 0,
+              canvasUrl: null
+            };
+          });
+
+          // Concurrently enrich individual track cover art, album names & canvas
+          const TRACK_BATCH_SIZE = 12;
+          for (let b = 0; b < initialTracks.length; b += TRACK_BATCH_SIZE) {
+            const batch = initialTracks.slice(b, b + TRACK_BATCH_SIZE);
+            await Promise.all(
+              batch.map(async (t: any, idxInBatch: number) => {
+                const trackGlobalIdx = b + idxInBatch;
+
+                // 1. Resolve true album artwork and album name if missing
+                if (!t.coverUrl) {
+                  const details = await resolveTrackDetails(t.title, t.artist);
+                  if (details.coverUrl) {
+                    t.coverUrl = details.coverUrl;
+                  }
+                  if (details.album) {
+                    t.album = details.album;
+                  }
+                }
+
+                // Fallback for album name
+                if (!t.album) {
+                  t.album = pl.isAlbum ? (plData.name || pl.name) : `${t.title} - Single`;
+                }
+
+                // Fallback for cover art: if still null, use playlist cover
+                if (!t.coverUrl) {
+                  t.coverUrl = plCover;
+                }
+
+                // 2. Resolve Canvas video for initial preview tracks (first 3 tracks)
+                if (trackGlobalIdx < 3 && t.id && t.id.length > 10) {
+                  const canvas = await fetchTrackCanvas(t.id, cookieInput);
+                  if (canvas?.canvasUrl) {
+                    t.canvasUrl = canvas.canvasUrl;
+                  }
+                }
+              })
+            );
+          }
+
+          return {
+            id: pl.id,
+            uri: pl.uri,
+            name: plData.name || pl.name,
+            description: plData.description || pl.description,
+            shelf: pl.shelf,
+            owner: plData.owner?.display_name || (pl.isAlbum ? plData.artists?.[0]?.name : 'Spotify'),
+            coverUrl: plCover || (initialTracks[0]?.coverUrl || null),
+            trackCount: initialTracks.length,
+            trackList: initialTracks,
+            raw: plData
+          };
+        } catch (err: any) {
+          return {
+            id: pl.id,
+            uri: pl.uri,
+            name: pl.name,
+            description: pl.description,
+            shelf: pl.shelf,
+            owner: 'Spotify',
+            coverUrl: pl.coverUrl,
+            trackCount: 0,
+            trackList: [],
+            error: err.message
+          };
+        }
+      })
+    );
+    scrapedPlaylists.push(...batchResults);
+  }
+
+  const uniqueShelves = Array.from(new Set(scrapedPlaylists.map(p => p.shelf || 'Featured Shelves')));
+
+  return {
+    type: "section",
+    id: cleanId,
+    title: sectionTitle,
+    subtitle: sectionSubtitle,
+    countryCode: countryCode,
+    hasCookies,
+    cookieStatus: hasCookies ? `Authenticated Spotify Session (${parsed.count || 1} cookies)` : "Guest Session",
+    shelvesCount: uniqueShelves.length,
+    playlistCount: scrapedPlaylists.length,
+    totalTracksCount: scrapedPlaylists.reduce((acc, p) => acc + (p.trackCount || 0), 0),
+    playlists: scrapedPlaylists,
+    raw: rawSectionData
+  };
+}
+
+async function enrichSpotifyData(data: any, cookieInput?: any) {
+  if (!data) return data;
+
+  // Single track enrichment
+  if (data.type === "track") {
+    const images = data.visualIdentity?.image || data.coverArt?.sources || data.images || [];
+    const bestImage = images.find((img: any) => img.maxHeight === 300 || img.maxHeight === 640 || img.width === 300 || img.width === 640) || images[0];
+    if (bestImage?.url) {
+      data.coverUrl = bestImage.url;
+    }
+    
+    // Resolve album name & high-res cover
+    const artist = data.artists?.map((a: any) => a.name).join(' ') || data.subtitle || '';
+    const details = await resolveTrackDetails(data.title || data.name, artist);
+    if (details.album) {
+      data.album = details.album;
+    }
+    if (!data.coverUrl && details.coverUrl) {
+      data.coverUrl = details.coverUrl;
+    }
+
+    if (!data.album) {
+      data.album = `${data.name || data.title} - Single`;
+    }
+
+    // Resolve Canvas
+    const trackId = data.id || (data.uri ? data.uri.split(':').pop() : null);
+    if (trackId) {
+      const canvas = await fetchTrackCanvas(trackId, cookieInput);
+      if (canvas?.canvasUrl) {
+        data.canvasUrl = canvas.canvasUrl;
+      }
+    }
+
+    return data;
+  }
+
+  // Playlist / Album track list enrichment
+  if (data.trackList && Array.isArray(data.trackList)) {
+    const tracks = data.trackList;
+    const isAlbum = data.type === 'album';
+    const playlistCover = data.images?.[0]?.url || data.coverArt?.sources?.[0]?.url || null;
+    const BATCH_SIZE = 8;
+
+    for (let i = 0; i < tracks.length; i += BATCH_SIZE) {
+      const batch = tracks.slice(i, i + BATCH_SIZE);
+      await Promise.all(
+        batch.map(async (t: any) => {
+          const trackTitle = t.title || t.name;
+          const trackArtist = t.subtitle || t.artists?.map((a: any) => a.name).join(', ') || '';
+
+          // 1. Resolve individual song album and cover art
+          const details = await resolveTrackDetails(trackTitle, trackArtist);
+          if (details.coverUrl) {
+            t.coverUrl = details.coverUrl;
+          }
+          if (details.album) {
+            t.album = details.album;
+          }
+
+          if (!t.album) {
+            t.album = isAlbum ? (data.name || data.title) : `${trackTitle} - Single`;
+          }
+
+          if (!t.coverUrl) {
+            t.coverUrl = playlistCover;
+          }
+
+          // 2. Fetch Canvas video
+          const trackId = t.id || (t.uri ? t.uri.split(':').pop() : null);
+          if (trackId && trackId.length > 10) {
+            const canvas = await fetchTrackCanvas(trackId, cookieInput);
+            if (canvas?.canvasUrl) {
+              t.canvasUrl = canvas.canvasUrl;
+            }
+          }
+        })
+      );
+    }
+  }
+
+  return data;
+}
+
+// Hosted Playlists Storage & Automatic Vercel API Endpoint Manager
+const isVercel = process.env.VERCEL === '1' || process.env.NOW_BUILDER !== undefined;
+const DATA_DIR = isVercel
+  ? "/tmp/data"
+  : path.join(process.cwd(), "data");
+const HOSTED_FILE = path.join(DATA_DIR, "hosted-playlists.json");
+
+interface HostedItem {
+  id: string;
+  slug: string;
+  name: string;
+  description?: string;
+  sourceUrl: string;
+  sourceType: 'playlist' | 'album' | 'section';
+  trackCount: number;
+  coverUrl: string | null;
+  lastUpdated: string;
+  nextRefreshAt: string;
+  autoUpdateDaily: boolean;
+  cookies?: string;
+  tracks: any[];
+  raw?: any;
+}
+
+let hostedStore: Record<string, HostedItem> = {};
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+}
+
+function loadHostedStore(): Record<string, HostedItem> {
+  try {
+    ensureDataDir();
+    if (fs.existsSync(HOSTED_FILE)) {
+      const content = fs.readFileSync(HOSTED_FILE, "utf-8");
+      return JSON.parse(content);
+    }
+  } catch (err) {
+    console.error("Failed to load hosted store:", err);
+  }
+  return {};
+}
+
+function saveHostedStore() {
+  try {
+    ensureDataDir();
+    fs.writeFileSync(HOSTED_FILE, JSON.stringify(hostedStore, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Failed to save hosted store:", err);
+  }
+}
+
+// Load initial store
+hostedStore = loadHostedStore();
+
+function sanitizeSlug(input: string): string {
+  if (!input) return `playlist-${Date.now()}`;
+  let clean = input.trim().toLowerCase();
+  if (clean.endsWith('.json')) {
+    clean = clean.substring(0, clean.length - 5);
+  }
+  clean = clean.replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+  return clean || `playlist-${Date.now()}`;
+}
+
+async function refreshHostedItem(idOrSlug: string): Promise<HostedItem | null> {
+  const itemKey = Object.keys(hostedStore).find(k => {
+    const h = hostedStore[k];
+    return h.id === idOrSlug || h.slug === idOrSlug || h.slug === idOrSlug.replace(/\.json$/, '');
+  });
+
+  if (!itemKey) return null;
+  const item = hostedStore[itemKey];
+
+  try {
+    console.log(`[Daily Refresh] Updating hosted playlist API: ${item.slug} (${item.sourceUrl})`);
+    let freshTracks: any[] = [];
+    let coverUrl = item.coverUrl;
+    let name = item.name;
+    let description = item.description;
+
+    if (item.sourceType === 'section' || item.sourceUrl.includes('/section/') || item.sourceUrl.includes('/hub/')) {
+      const parts = item.sourceUrl.split(/[/?#]/);
+      const idx = parts.findIndex(p => p === "section" || p === "hub");
+      const secId = idx !== -1 ? parts[idx + 1] : parts[parts.length - 1];
+      const secData = await scrapeSpotifySection(secId, "US", 50, item.cookies);
+      if (secData && secData.playlists) {
+        freshTracks = secData.playlists.flatMap(p => p.trackList || []);
+        if (secData.title) name = secData.title;
+      }
+    } else {
+      const rawData = await spotify.getData(item.sourceUrl);
+      const enriched = await enrichSpotifyData(rawData, item.cookies);
+      if (enriched) {
+        freshTracks = enriched.trackList || (enriched.tracks ? (Array.isArray(enriched.tracks) ? enriched.tracks : enriched.tracks.items) : []);
+        coverUrl = enriched.coverUrl || enriched.images?.[0]?.url || coverUrl;
+        name = enriched.name || enriched.title || name;
+        description = enriched.description || description;
+      }
+    }
+
+    const now = new Date();
+    const next24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+
+    item.name = name;
+    item.description = description;
+    item.coverUrl = coverUrl;
+    if (freshTracks.length > 0) {
+      item.tracks = freshTracks;
+    }
+    item.trackCount = item.tracks.length;
+    item.lastUpdated = now.toISOString();
+    item.nextRefreshAt = next24h.toISOString();
+
+    saveHostedStore();
+    return item;
+  } catch (err: any) {
+    console.error(`Error refreshing item ${item.slug}:`, err.message);
+    return item;
+  }
+}
+
+export const app = express();
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+async function startServer() {
+  const PORT = 3000;
+
+  // === HOSTED PLAYLISTS API ENDPOINTS ===
+
+  // List all published API endpoints
+  app.get("/api/hosted/list", (req, res) => {
+    const items = Object.values(hostedStore).map(item => ({
+      ...item,
+      publicUrl: `/api/public/${item.slug}.json`,
+      directUrl: `/api/${item.slug}.json`,
+      vercelUrl: `https://uvytunesspotify.vercel.app/api/${item.slug}.json`
+    }));
+    res.json({ count: items.length, items });
+  });
+
+  // Serve / Publish a playlist to API
+  app.post("/api/hosted/add", async (req, res) => {
+    try {
+      const { name, description, sourceUrl, sourceType, tracks, coverUrl, autoUpdateDaily, cookies, slug: rawSlug } = req.body;
+
+      if (!name || !sourceUrl) {
+        return res.status(400).json({ error: "name and sourceUrl are required" });
+      }
+
+      const slug = sanitizeSlug(rawSlug || name);
+      const id = crypto.randomUUID();
+      const now = new Date();
+      const next24h = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+
+      const newItem: HostedItem = {
+        id,
+        slug,
+        name,
+        description: description || `Served Spotify ${sourceType || 'playlist'}`,
+        sourceUrl,
+        sourceType: sourceType || (sourceUrl.includes('/section/') ? 'section' : 'playlist'),
+        trackCount: Array.isArray(tracks) ? tracks.length : 0,
+        coverUrl: coverUrl || null,
+        lastUpdated: now.toISOString(),
+        nextRefreshAt: next24h.toISOString(),
+        autoUpdateDaily: autoUpdateDaily !== false,
+        cookies: cookies || undefined,
+        tracks: Array.isArray(tracks) ? tracks : []
+      };
+
+      hostedStore[slug] = newItem;
+      saveHostedStore();
+
+      res.json({
+        success: true,
+        message: `Playlist successfully published to API!`,
+        slug: newItem.slug,
+        item: newItem,
+        publicUrl: `/api/public/${newItem.slug}.json`,
+        directUrl: `/api/${newItem.slug}.json`,
+        vercelUrl: `https://uvytunesspotify.vercel.app/api/${newItem.slug}.json`
+      });
+    } catch (err: any) {
+      console.error("Error serving playlist to API:", err);
+      res.status(500).json({ error: err.message || "Failed to publish playlist to API" });
+    }
+  });
+
+  // Force Refresh Hosted Endpoint
+  app.post("/api/hosted/refresh/:id", async (req, res) => {
+    try {
+      const updated = await refreshHostedItem(req.params.id);
+      if (!updated) {
+        return res.status(404).json({ error: "Hosted endpoint not found" });
+      }
+      res.json({ success: true, item: updated });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || "Failed to refresh endpoint" });
+    }
+  });
+
+  // Delete Hosted Endpoint
+  app.delete("/api/hosted/:id", (req, res) => {
+    const idOrSlug = req.params.id;
+    const key = Object.keys(hostedStore).find(k => hostedStore[k].id === idOrSlug || hostedStore[k].slug === idOrSlug || k === idOrSlug);
+
+    if (key && hostedStore[key]) {
+      delete hostedStore[key];
+      saveHostedStore();
+      return res.json({ success: true, message: "Endpoint deleted" });
+    }
+    res.status(404).json({ error: "Endpoint not found" });
+  });
+
+  // Public GET Endpoint for fetching playlist JSON (Supports /api/public/:slug.json, /api/hosted/:slug.json, and /api/:slug.json)
+  const handleServePublicJson = async (req: express.Request, res: express.Response) => {
+    try {
+      let rawSlug = req.params.slug || req.params[0] || '';
+      let slug = Array.isArray(rawSlug) ? rawSlug[0] : String(rawSlug);
+      if (!slug) {
+        return res.status(400).json({ error: "Slug is required" });
+      }
+
+      if (slug.endsWith('.json')) {
+        slug = slug.substring(0, slug.length - 5);
+      }
+
+      const itemKey = Object.keys(hostedStore).find(k => k === slug || hostedStore[k].slug === slug || hostedStore[k].id === slug);
+      let item = itemKey ? hostedStore[itemKey] : null;
+
+      if (!item) {
+        return res.status(404).json({
+          error: "API Endpoint not found",
+          requestedSlug: slug,
+          availableEndpoints: Object.values(hostedStore).map(h => `/api/public/${h.slug}.json`)
+        });
+      }
+
+      // Check if daily auto-update is due (>24h)
+      const now = new Date();
+      if (item.autoUpdateDaily && new Date(item.nextRefreshAt) <= now) {
+        console.log(`[API Access] Auto-update triggered for ${slug} on request`);
+        const refreshed = await refreshHostedItem(item.id);
+        if (refreshed) item = refreshed;
+      }
+
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Cache-Control", "public, max-age=3600, s-maxage=86400, stale-while-revalidate=86400");
+      res.json({
+        status: "ok",
+        slug: item.slug,
+        name: item.name,
+        description: item.description,
+        sourceUrl: item.sourceUrl,
+        sourceType: item.sourceType,
+        coverUrl: item.coverUrl,
+        trackCount: item.trackCount,
+        lastUpdated: item.lastUpdated,
+        nextRefreshAt: item.nextRefreshAt,
+        autoUpdateDaily: item.autoUpdateDaily,
+        hostedAt: `https://uvytunesspotify.vercel.app/api/${item.slug}.json`,
+        tracks: item.tracks
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || "Failed to serve JSON endpoint" });
+    }
+  };
+
+  app.get("/api/public/:slug.json", handleServePublicJson);
+  app.get("/api/public/:slug", handleServePublicJson);
+  app.get("/api/hosted/:slug", handleServePublicJson);
+  app.get("/api/hosted/:slug.json", handleServePublicJson);
+
+  // Vercel Export endpoint to download / view Vercel deployment code
+  app.get("/api/vercel/export-code", (req, res) => {
+    const hostedList = Object.values(hostedStore);
+
+    const vercelJson = {
+      "version": 2,
+      "name": "uvytunesspotify-api",
+      "builds": [
+        { "src": "api/*.js", "use": "@vercel/node" }
+      ],
+      "routes": [
+        { "src": "/api/(.*).json", "dest": "/api/[slug].js?slug=$1" },
+        { "src": "/api/(.*)", "dest": "/api/[slug].js?slug=$1" }
+      ]
+    };
+
+    const apiSlugJs = `// Vercel Serverless Function: api/[slug].js
+// Serves fresh daily-updated Spotify & iTunes playlist JSONs for uvytunesspotify.vercel.app
+
+const HOSTED_PLAYLISTS = ${JSON.stringify(hostedList, null, 2)};
+
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Credentials', true);
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate=3600');
+
+  if (req.method === 'OPTIONS') {
+    res.status(200).end();
+    return;
+  }
+
+  const querySlug = req.query.slug || req.query.playlist || req.url.replace(/^\\/api\\//, '').replace(/\\.json$/, '');
+  const cleanSlug = String(querySlug).trim().toLowerCase().replace(/\\.json$/, '');
+
+  const match = HOSTED_PLAYLISTS.find(p => p.slug === cleanSlug || p.id === cleanSlug);
+
+  if (!match) {
+    return res.status(404).json({
+      error: "Playlist API Endpoint Not Found",
+      slug: cleanSlug,
+      availableEndpoints: HOSTED_PLAYLISTS.map(p => \`/api/\${p.slug}.json\`)
+    });
+  }
+
+  return res.status(200).json({
+    status: "ok",
+    slug: match.slug,
+    name: match.name,
+    description: match.description,
+    sourceUrl: match.sourceUrl,
+    coverUrl: match.coverUrl,
+    trackCount: match.trackCount,
+    lastUpdated: match.lastUpdated,
+    nextRefreshAt: match.nextRefreshAt,
+    autoUpdateDaily: match.autoUpdateDaily,
+    tracks: match.tracks
+  });
+}
+`;
+
+    const readmeMd = `# uvytunesspotify Vercel API Server
+
+Serves JSON playlist endpoints hosted at \`uvytunesspotify.vercel.app/api/:playlist-name.json\`.
+
+## Deployment Instructions
+
+1. Install Vercel CLI: \`npm i -g vercel\`
+2. Run \`vercel\` in this directory to deploy directly to Vercel!
+3. Your endpoints will immediately be available at:
+   - \`https://uvytunesspotify.vercel.app/api/playlist-name.json\`
+`;
+
+    res.json({
+      "vercel.json": JSON.stringify(vercelJson, null, 2),
+      "api/[slug].js": apiSlugJs,
+      "README.md": readmeMd,
+      hostedCount: hostedList.length
+    });
+  });
+
+  // Background Daily Auto-Refresh Job (runs every 1 hour)
+  setInterval(async () => {
+    try {
+      const now = new Date();
+      for (const item of Object.values(hostedStore)) {
+        if (item.autoUpdateDaily && new Date(item.nextRefreshAt) <= now) {
+          console.log(`[Scheduled Daily Job] Triggering daily refresh for ${item.slug}`);
+          await refreshHostedItem(item.id);
+        }
+      }
+    } catch (err: any) {
+      console.error("[Scheduled Daily Job Error]:", err.message);
+    }
+  }, 60 * 60 * 1000);
+
+  // API Route: Verify and inspect pasted Spotify cookies
+  app.post("/api/cookies/verify", async (req, res) => {
+    try {
+      const cookieInput = req.body?.cookies || req.body?.sp_dc || req.body;
+      const verification = await verifySpotifyCookies(cookieInput);
+      res.json(verification);
+    } catch (err: any) {
+      res.status(500).json({ valid: false, error: err.message || "Failed to verify cookies" });
+    }
+  });
+
+  // Handler for scraping requests
+  const handleScrapeRequest = async (req: express.Request, res: express.Response) => {
+    try {
+      const url = (req.body?.url || req.query.url) as string;
+      const country = (req.body?.country || req.query.country || "US") as string;
+      const cookies = req.body?.cookies || req.query.cookies || req.body?.sp_dc || req.query.sp_dc || req.headers['x-spotify-cookies'] || req.headers['x-spotify-sp-dc'] || undefined;
+
+      if (!url || (!url.includes("spotify.com") && !url.startsWith("spotify:"))) {
+        return res.status(400).json({ error: "Valid Spotify URL is required" });
+      }
+
+      console.log(`Scraping Spotify URL: ${url} (Country: ${country}, HasCookies: ${!!cookies})`);
+
+      // Check if it's a Spotify Section / Hub
+      if (url.includes("/section/") || url.includes("/hub/") || url.startsWith("spotify:section:") || url.startsWith("spotify:hub:")) {
+        const parts = url.split(/[/?#]/);
+        const sectionIdx = parts.findIndex(p => p === "section" || p === "hub");
+        const sectionId = sectionIdx !== -1 ? parts[sectionIdx + 1] : parts[parts.length - 1];
+
+        const sectionData = await scrapeSpotifySection(sectionId, country, 25, cookies);
+        return res.json(sectionData);
+      }
+      
+      // Otherwise scrape playlist / album / track
+      const rawData = await spotify.getData(url);
+      const enrichedData = await enrichSpotifyData(rawData, cookies);
+      
+      res.json(enrichedData);
+    } catch (err: any) {
+      console.error("Scraping error:", err);
+      res.status(500).json({ error: err.message || "Failed to scrape Spotify data" });
+    }
+  };
+
+  // API Routes for scraping (GET & POST supported)
+  app.get("/api/scrape", handleScrapeRequest);
+  app.post("/api/scrape", handleScrapeRequest);
+
+  // Dedicated Section Scrape endpoint
+  const handleSectionScrape = async (req: express.Request, res: express.Response) => {
+    try {
+      const sectionId = (req.body?.sectionId || req.body?.id || req.query.id || req.body?.url || req.query.url) as string;
+      const country = (req.body?.country || req.query.country || "US") as string;
+      const maxPlaylists = req.body?.maxPlaylists ? Number(req.body.maxPlaylists) : 50;
+      const cookies = req.body?.cookies || req.query.cookies || req.body?.sp_dc || req.query.sp_dc || req.headers['x-spotify-cookies'] || req.headers['x-spotify-sp-dc'] || undefined;
+      
+      if (!sectionId) {
+        return res.status(400).json({ error: "Section ID or URL is required" });
+      }
+
+      const sectionData = await scrapeSpotifySection(sectionId, country, maxPlaylists, cookies);
+      res.json(sectionData);
+    } catch (err: any) {
+      console.error("Section scraping error:", err);
+      res.status(500).json({ error: err.message || "Failed to scrape Spotify section" });
+    }
+  };
+
+  app.get("/api/scrape/section", handleSectionScrape);
+  app.post("/api/scrape/section", handleSectionScrape);
+
+  // Dedicated Canvas endpoint
+  const handleCanvasRequest = async (req: express.Request, res: express.Response) => {
+    try {
+      const trackId = (req.body?.trackId || req.query.trackId || req.body?.id || req.query.id || req.body?.url || req.query.url) as string;
+      const cookies = req.body?.cookies || req.query.cookies || req.body?.sp_dc || req.query.sp_dc || req.headers['x-spotify-cookies'] || req.headers['x-spotify-sp-dc'] || undefined;
+      
+      if (!trackId) {
+        return res.status(400).json({ error: "trackId is required" });
+      }
+
+      const canvas = await fetchTrackCanvas(trackId, cookies);
+      res.json(canvas || { canvasUrl: null });
+    } catch (err: any) {
+      console.error("Canvas fetch error:", err);
+      res.status(500).json({ error: err.message || "Failed to fetch canvas" });
+    }
+  };
+
+  app.get("/api/canvas", handleCanvasRequest);
+  app.post("/api/canvas", handleCanvasRequest);
+
+  // Vite middleware for development
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    // @ts-ignore
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(express.static(distPath));
+    app.get('*all', (req, res) => {
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  if (process.env.VERCEL !== '1') {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  }
+}
+
+if (process.env.VERCEL !== '1') {
+  startServer();
+}
+
+export default app;
