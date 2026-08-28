@@ -2,7 +2,6 @@ import express from "express";
 import path from "path";
 import crypto from "crypto";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 // @ts-ignore
 import spotifyUrlInfo from "spotify-url-info";
 
@@ -1511,7 +1510,8 @@ async function startServer() {
   }, 60 * 60 * 1000);
 
   // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  if (process.env.NODE_ENV !== "production" && process.env.VERCEL !== '1') {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
