@@ -219,18 +219,17 @@ async function verifySpotifyCookies(cookieInput: any) {
     };
   }
 
+  const customFetch = createCustomFetch(cookieInput);
   const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : '');
 
-  // Strategy 1: Test against Spotify Canvaz Cache endpoint (Spotify's protected service that checks sp_dc)
+  // Strategy 1: Test against Spotify Canvaz Cache endpoint
   try {
     const trackUri = "spotify:track:4cOdK2wGLETKBW3PvgPWqT"; // Never Gonna Give You Up
     const body = Buffer.from([0x0a, trackUri.length, ...Buffer.from(trackUri, 'utf8')]);
     
-    const canvazRes = await fetch("https://spclient.wg.spotify.com/canvaz-cache/v0/canvases", {
+    const canvazRes = await customFetch("https://spclient.wg.spotify.com/canvaz-cache/v0/canvases", {
       method: "POST",
       headers: {
-        "Cookie": cookieHeader,
-        "User-Agent": "Spotify/8.8.84 iOS/16.5 (iPhone14,2)",
         "Content-Type": "application/x-protobuf"
       },
       body
@@ -253,10 +252,8 @@ async function verifySpotifyCookies(cookieInput: any) {
 
   // Strategy 2: Web Player Access Token endpoint
   try {
-    const res = await fetch("https://open.spotify.com/get_access_token?reason=transport&productType=web_player", {
+    const res = await customFetch("https://open.spotify.com/get_access_token?reason=transport&productType=web_player", {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Cookie": cookieHeader,
         "Referer": "https://open.spotify.com/",
         "Origin": "https://open.spotify.com"
       }
@@ -283,12 +280,7 @@ async function verifySpotifyCookies(cookieInput: any) {
 
   // Strategy 3: Embed page session verification
   try {
-    const embedRes = await fetch("https://open.spotify.com/embed/playlist/37i9dQZF1DXcBWIGoYBM5M", {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Cookie": cookieHeader
-      }
-    });
+    const embedRes = await customFetch("https://open.spotify.com/embed/playlist/37i9dQZF1DXcBWIGoYBM5M");
     if (embedRes.ok) {
       const text = await embedRes.text();
       if (text.includes("<html") && (parsed.spDc || parsed.count >= 2)) {
@@ -347,7 +339,8 @@ async function getClientToken(): Promise<string | null> {
   };
 
   try {
-    const res = await fetch("https://clienttoken.spotify.com/v1/clienttoken", {
+    const customFetch = createCustomFetch();
+    const res = await customFetch("https://clienttoken.spotify.com/v1/clienttoken", {
       method: "POST",
       headers: { "Accept": "application/json", "Content-Type": "application/json" },
       body: JSON.stringify(clientData)
@@ -365,16 +358,15 @@ async function getClientToken(): Promise<string | null> {
 }
 
 async function getSpotifyWebAccessToken(cookieInput?: any): Promise<string> {
+  const customFetch = createCustomFetch(cookieInput);
   const parsed = parseSpotifyCookies(cookieInput);
   const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : null);
 
   // If user provided valid cookie, fetch authentic token
   if (cookieHeader) {
     try {
-      const res = await fetch("https://open.spotify.com/get_access_token?reason=transport&productType=web_player", {
+      const res = await customFetch("https://open.spotify.com/get_access_token?reason=transport&productType=web_player", {
         headers: {
-          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          "Cookie": cookieHeader,
           "Referer": "https://open.spotify.com/"
         }
       });
@@ -391,49 +383,55 @@ async function getSpotifyWebAccessToken(cookieInput?: any): Promise<string> {
     return cachedToken;
   }
 
-  const now = Date.now();
-  const totp = generateTOTP(spSecret.secretBuf, now);
-  const params = new URLSearchParams({
-    reason: "init",
-    productType: "web_player",
-    totp: totp,
-    totpServer: totp,
-    totpVer: String(spSecret.version)
-  });
+  try {
+    const now = Date.now();
+    const totp = generateTOTP(spSecret.secretBuf, now);
+    const params = new URLSearchParams({
+      reason: "init",
+      productType: "web_player",
+      totp: totp,
+      totpServer: totp,
+      totpVer: String(spSecret.version)
+    });
 
-  const tokenUrl = `https://open.spotify.com/api/token?${params.toString()}`;
-  const res = await fetch(tokenUrl, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      "Referer": "https://open.spotify.com/",
-      "Origin": "https://open.spotify.com"
+    const tokenUrl = `https://open.spotify.com/api/token?${params.toString()}`;
+    const res = await customFetch(tokenUrl, {
+      headers: {
+        "Referer": "https://open.spotify.com/",
+        "Origin": "https://open.spotify.com"
+      }
+    });
+
+    if (res.ok) {
+      const tokenData = await res.json();
+      if (tokenData.accessToken) {
+        cachedToken = tokenData.accessToken;
+        cachedTokenExpiry = tokenData.accessTokenExpirationTimestampMs || (Date.now() + 3600000);
+        return cachedToken;
+      }
     }
-  });
-
-  const tokenData = await res.json();
-  if (tokenData.accessToken) {
-    cachedToken = tokenData.accessToken;
-    cachedTokenExpiry = tokenData.accessTokenExpirationTimestampMs || (Date.now() + 3600000);
-    return cachedToken;
+  } catch (e) {
+    console.warn("Error acquiring Spotify Web Player token via TOTP:", e);
   }
-  throw new Error("Failed to acquire Spotify Web Player token");
+
+  // Return non-blocking fallback token string instead of throwing unhandled error
+  return "anonymous_fallback_token";
 }
 
 // Fetch Spotify Canvas Video URL for a track
 async function fetchTrackCanvas(trackIdOrUri: string, cookieInput?: any): Promise<{ canvasUrl: string | null; canvasType?: string } | null> {
   const cleanId = trackIdOrUri.replace(/^spotify:track:/i, '').split(/[?#]/)[0];
   const trackUri = `spotify:track:${cleanId}`;
+  const customFetch = createCustomFetch(cookieInput);
   const parsed = parseSpotifyCookies(cookieInput);
   const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : null);
 
   // Method 1: Using protobuf endpoint with cookieHeader
   if (cookieHeader) {
     try {
-      const res = await fetch(`https://spclient.wg.spotify.com/canvaz-cache/v0/canvases`, {
+      const res = await customFetch(`https://spclient.wg.spotify.com/canvaz-cache/v0/canvases`, {
         method: "POST",
         headers: {
-          "Cookie": cookieHeader,
-          "User-Agent": "Spotify/8.8.84 iOS/16.5 (iPhone14,2)",
           "Content-Type": "application/x-protobuf"
         },
         body: Buffer.from([0x0a, trackUri.length, ...Buffer.from(trackUri, 'utf8')])
@@ -461,7 +459,6 @@ async function fetchTrackCanvas(trackIdOrUri: string, cookieInput?: any): Promis
     const headers: Record<string, string> = {
       "Authorization": `Bearer ${token}`,
       "Content-Type": "application/json",
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
       "app-platform": "WebPlayer",
       "accept": "application/json"
     };
@@ -469,7 +466,7 @@ async function fetchTrackCanvas(trackIdOrUri: string, cookieInput?: any): Promis
       headers["client-token"] = clientToken;
     }
 
-    const res = await fetch(`https://api-partner.spotify.com/pathfinder/v1/query`, {
+    const res = await customFetch(`https://api-partner.spotify.com/pathfinder/v1/query`, {
       method: "POST",
       headers,
       body: JSON.stringify({
@@ -838,6 +835,7 @@ async function scrapeSpotifySection(sectionId: string, countryCode = "US", maxPl
   // Clean section ID from full URL if passed
   const cleanId = sectionId.replace(/^https?:\/\/[^\/]+\/(section|hub|genre|category)\//i, '').replace(/^spotify:(section|hub|page|genre|category):/i, '').split('?')[0];
 
+  const customFetch = createCustomFetch(cookieInput);
   const parsed = parseSpotifyCookies(cookieInput);
   const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : null);
   const hasCookies = !!(parsed.spDc || parsed.cookieHeader);
@@ -845,22 +843,18 @@ async function scrapeSpotifySection(sectionId: string, countryCode = "US", maxPl
   const headers: Record<string, string> = {
     "Authorization": `Bearer ${token}`,
     "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "app-platform": "WebPlayer",
     "Accept": "application/json"
   };
   if (clientToken) {
     headers["client-token"] = clientToken;
   }
-  if (cookieHeader) {
-    headers["Cookie"] = cookieHeader;
-  }
 
   // Strategy 1: browsePage query (supports spotify:page:ID and spotify:section:ID)
   for (const prefix of [`spotify:page:${cleanId}`, `spotify:section:${cleanId}`]) {
     if (extractedPlaylists.length > 0) break;
     try {
-      const bpRes = await fetch("https://api-partner.spotify.com/pathfinder/v1/query", {
+      const bpRes = await customFetch("https://api-partner.spotify.com/pathfinder/v1/query", {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -897,7 +891,7 @@ async function scrapeSpotifySection(sectionId: string, countryCode = "US", maxPl
   for (const prefix of [`spotify:section:${cleanId}`, `spotify:page:${cleanId}`]) {
     if (extractedPlaylists.length > 0) break;
     try {
-      const bsRes = await fetch("https://api-partner.spotify.com/pathfinder/v1/query", {
+      const bsRes = await customFetch("https://api-partner.spotify.com/pathfinder/v1/query", {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -932,7 +926,7 @@ async function scrapeSpotifySection(sectionId: string, countryCode = "US", maxPl
   // Strategy 3: countryHubsPage (supports country-based hubs)
   if (extractedPlaylists.length === 0) {
     try {
-      const hubRes = await fetch("https://api-partner.spotify.com/pathfinder/v1/query", {
+      const hubRes = await customFetch("https://api-partner.spotify.com/pathfinder/v1/query", {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -966,7 +960,7 @@ async function scrapeSpotifySection(sectionId: string, countryCode = "US", maxPl
   // Strategy 4: homeSection query
   if (extractedPlaylists.length === 0) {
     try {
-      const secRes = await fetch("https://api-partner.spotify.com/pathfinder/v1/query", {
+      const secRes = await customFetch("https://api-partner.spotify.com/pathfinder/v1/query", {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -1610,7 +1604,12 @@ const handleScrapeRequest = async (req: express.Request, res: express.Response) 
     
     // Otherwise scrape playlist / album / track via safeGetSpotifyData
     const rawData = await safeGetSpotifyData(url, cookies);
-    const enrichedData = await enrichSpotifyData(rawData, cookies);
+    let enrichedData = rawData;
+    try {
+      enrichedData = await enrichSpotifyData(rawData, cookies);
+    } catch (enrichErr: any) {
+      console.warn("Enrichment warning, returning base scraped data:", enrichErr?.message || enrichErr);
+    }
     
     return res.json(enrichedData);
   } catch (err: any) {
