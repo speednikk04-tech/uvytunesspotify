@@ -233,8 +233,17 @@ export const HostedApiManager: React.FC<HostedApiManagerProps> = ({ onClose }) =
                           {ep.name}
                         </h3>
                         <p className="text-xs text-neutral-400 mt-0.5 font-medium">
-                          {ep.trackCount} tracks served • Last updated {new Date(ep.lastUpdated).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          {ep.playlists ? `${ep.playlists.length} playlists • ` : ''}{ep.trackCount} tracks served • Last updated {new Date(ep.lastUpdated).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                         </p>
+                        {ep.playlists && ep.playlists.length > 0 && (
+                          <div className="mt-2.5 flex flex-wrap gap-1.5 max-w-[280px] sm:max-w-sm md:max-w-md lg:max-w-xl">
+                            {ep.playlists.map((pl: any, idx: number) => (
+                              <span key={idx} className="bg-neutral-800 text-[10px] text-neutral-300 px-2 py-0.5 rounded border border-neutral-700 truncate max-w-[120px]" title={pl.name || pl.title}>
+                                {pl.name || pl.title}
+                              </span>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     </div>
 

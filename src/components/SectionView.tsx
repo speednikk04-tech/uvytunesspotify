@@ -163,7 +163,7 @@ export const SectionView: React.FC<SectionViewProps> = ({ section, onBack, onSel
                   onClick={() => onServePlaylistToApi({
                     name: section.title,
                     description: section.subtitle || `Spotify Section (${section.playlistCount} playlists)`,
-                    sourceUrl: `https://open.spotify.com/section/${section.id}`,
+                    sourceUrl: section.raw?.isCustomSection ? 'custom-section' : `https://open.spotify.com/section/${section.id}`,
                     sourceType: 'section',
                     tracks: section.playlists.flatMap(p => p.trackList || []),
                     playlists: section.playlists,

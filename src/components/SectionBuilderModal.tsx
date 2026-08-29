@@ -48,24 +48,41 @@ export const SectionBuilderModal: React.FC<SectionBuilderModalProps> = ({ onClos
         throw new Error('No tracks found in the provided URL');
       }
 
+      const playlistCoverUrl = data.coverUrl 
+        || data.images?.[0]?.url 
+        || data.visualIdentity?.image?.find((img: any) => img.maxHeight === 300 || img.maxHeight === 640)?.url
+        || data.visualIdentity?.image?.[0]?.url
+        || (data.coverArt?.sources ? (data.coverArt.sources[2]?.url || data.coverArt.sources[0]?.url) : null);
+
       const newPlaylist: UnifiedSectionPlaylist = {
         id: data.id || data.uri || crypto.randomUUID(),
         uri: data.uri || `spotify:playlist:${crypto.randomUUID()}`,
         name: data.name || data.title || 'Scraped Playlist',
         description: data.description || data.owner?.display_name || 'Custom Added',
-        coverUrl: data.coverUrl || data.images?.[0]?.url || null,
+        coverUrl: playlistCoverUrl,
         trackCount: trackList.length,
-        trackList: trackList.map((t: any, idx: number) => ({
-          id: t.id || t.uri || `track-${idx}`,
-          uri: t.uri,
-          title: t.title || t.name || 'Unknown Title',
-          artist: t.artist || t.subtitle || (Array.isArray(t.artists) ? t.artists.map((a: any) => a.name).join(', ') : 'Unknown Artist'),
-          album: t.album || 'Spotify Track',
-          coverUrl: t.coverUrl || data.coverUrl || null,
-          previewUrl: t.previewUrl || t.audioPreview?.url || null,
-          durationMs: t.durationMs || t.duration || 0,
-          canvasUrl: t.canvasUrl || null
-        })),
+        trackList: trackList.map((t: any, idx: number) => {
+          const trackSpecificCover = t.coverUrl 
+            || t.albumArt
+            || t.album?.images?.[0]?.url 
+            || t.visualIdentity?.image?.find((img: any) => img.maxHeight === 300 || img.maxHeight === 640)?.url
+            || t.visualIdentity?.image?.[0]?.url 
+            || t.image?.find((img: any) => img.maxHeight === 300 || img.maxHeight === 640)?.url
+            || t.image?.[0]?.url 
+            || (t.coverArt?.sources ? (t.coverArt.sources[2]?.url || t.coverArt.sources[0]?.url) : null);
+          const finalCover = trackSpecificCover || data.coverUrl || data.images?.[0]?.url || null;
+          return {
+            id: t.id || t.uri || `track-${idx}`,
+            uri: t.uri,
+            title: t.title || t.name || 'Unknown Title',
+            artist: t.artist || t.subtitle || (Array.isArray(t.artists) ? t.artists.map((a: any) => a.name).join(', ') : 'Unknown Artist'),
+            album: t.album || 'Spotify Track',
+            coverUrl: finalCover,
+            previewUrl: t.previewUrl || t.audioPreview?.url || null,
+            durationMs: t.durationMs || t.duration || 0,
+            canvasUrl: t.canvasUrl || null
+          };
+        }),
         raw: data.raw || data
       };
 

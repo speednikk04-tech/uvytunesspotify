@@ -139,7 +139,7 @@ const normalizeData = (parsed: any): { unified: UnifiedPlaylist | null; unifiedS
               || track.visualIdentity?.image?.[0]?.url 
               || track.image?.find((img: any) => img.maxHeight === 300 || img.maxHeight === 640)?.url
               || track.image?.[0]?.url 
-              || (track.coverArt?.sources ? track.coverArt.sources[0]?.url : null);
+              || (track.coverArt?.sources ? (track.coverArt.sources[2]?.url || track.coverArt.sources[0]?.url) : null);
 
             const finalCover = trackSpecificCover || playlistCover || null;
 
