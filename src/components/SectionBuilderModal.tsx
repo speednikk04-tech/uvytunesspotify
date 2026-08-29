@@ -48,18 +48,19 @@ export const SectionBuilderModal: React.FC<SectionBuilderModalProps> = ({ onClos
         throw new Error('No tracks found in the provided URL');
       }
 
-      const playlistCoverUrl = data.coverUrl 
+      const playlistCover = data.coverUrl 
         || data.images?.[0]?.url 
         || data.visualIdentity?.image?.find((img: any) => img.maxHeight === 300 || img.maxHeight === 640)?.url
         || data.visualIdentity?.image?.[0]?.url
-        || (data.coverArt?.sources ? (data.coverArt.sources[2]?.url || data.coverArt.sources[0]?.url) : null);
+        || (data.coverArt?.sources ? (data.coverArt.sources[2]?.url || data.coverArt.sources[0]?.url) : null)
+        || null;
 
       const newPlaylist: UnifiedSectionPlaylist = {
         id: data.id || data.uri || crypto.randomUUID(),
         uri: data.uri || `spotify:playlist:${crypto.randomUUID()}`,
         name: data.name || data.title || 'Scraped Playlist',
         description: data.description || data.owner?.display_name || 'Custom Added',
-        coverUrl: playlistCoverUrl,
+        coverUrl: playlistCover,
         trackCount: trackList.length,
         trackList: trackList.map((t: any, idx: number) => {
           const trackSpecificCover = t.coverUrl 
@@ -70,7 +71,7 @@ export const SectionBuilderModal: React.FC<SectionBuilderModalProps> = ({ onClos
             || t.image?.find((img: any) => img.maxHeight === 300 || img.maxHeight === 640)?.url
             || t.image?.[0]?.url 
             || (t.coverArt?.sources ? (t.coverArt.sources[2]?.url || t.coverArt.sources[0]?.url) : null);
-          const finalCover = trackSpecificCover || data.coverUrl || data.images?.[0]?.url || null;
+          const finalCover = trackSpecificCover || playlistCover;
           return {
             id: t.id || t.uri || `track-${idx}`,
             uri: t.uri,

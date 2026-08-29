@@ -1175,16 +1175,7 @@ async function enrichSpotifyData(data: any, cookieInput?: any) {
   if (data.trackList && Array.isArray(data.trackList)) {
     const tracks = data.trackList;
     const isAlbum = data.type === 'album';
-    
-    // Robustly extract playlist cover
-    const playlistCover = data.coverUrl 
-      || data.images?.[0]?.url 
-      || data.visualIdentity?.image?.find((img: any) => img.maxHeight === 300 || img.maxHeight === 640)?.url
-      || data.visualIdentity?.image?.[0]?.url 
-      || (data.coverArt?.sources ? (data.coverArt.sources[2]?.url || data.coverArt.sources[0]?.url) : null);
-      
-    data.coverUrl = playlistCover;
-
+    const playlistCover = data.images?.[0]?.url || data.coverArt?.sources?.[0]?.url || null;
     const BATCH_SIZE = 8;
 
     for (let i = 0; i < tracks.length; i += BATCH_SIZE) {
