@@ -3,7 +3,7 @@ import path from "path";
 import crypto from "crypto";
 import fs from "fs";
 // @ts-ignore
-import * as spotifyUrlInfoModule from "spotify-url-info";
+import spotifyUrlInfo from "spotify-url-info";
 
 // Hardcoded Cloudflare Worker Proxy URL for Spotify Edge Scraper
 const HARDCODED_CF_WORKER_URL = "https://spotify.nikkexe.workers.dev";
@@ -53,8 +53,7 @@ const createCustomFetch = (cookieInput?: any) => {
 function initSpotifyUrlInfo(customFetchFn: any) {
   try {
     // @ts-ignore
-    const sui = spotifyUrlInfoModule;
-    const fn = typeof sui === "function" ? sui : (sui && (sui as any).default);
+    const fn = typeof spotifyUrlInfo === "function" ? spotifyUrlInfo : (spotifyUrlInfo && spotifyUrlInfo.default);
     if (typeof fn === "function") {
       return fn(customFetchFn);
     }
