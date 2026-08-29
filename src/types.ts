@@ -116,6 +116,7 @@ export interface HostedPlaylistEndpoint {
   autoUpdateDaily: boolean;
   cookies?: string;
   tracks: UnifiedTrack[];
+  playlists?: any[];
   raw?: any;
 }
 

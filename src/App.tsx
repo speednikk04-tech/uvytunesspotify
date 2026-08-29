@@ -7,6 +7,7 @@ import { SpotifyScraperModal } from './components/SpotifyScraperModal';
 import { ApiDocs } from './components/ApiDocs';
 import { ServeToApiModal } from './components/ServeToApiModal';
 import { HostedApiManager } from './components/HostedApiManager';
+import { SectionBuilderModal } from './components/SectionBuilderModal';
 
 const normalizeData = (parsed: any): { unified: UnifiedPlaylist | null; unifiedSection: UnifiedSection | null; raw: any } => {
   if (!parsed) return { unified: null, unifiedSection: null, raw: null };
@@ -212,6 +213,7 @@ export default function App() {
   const [isMuted, setIsMuted] = useState(false);
   const [showDocs, setShowDocs] = useState(false);
   const [showSpotifyScraper, setShowSpotifyScraper] = useState(false);
+  const [showSectionBuilder, setShowSectionBuilder] = useState(false);
   const [showHostedManager, setShowHostedManager] = useState(false);
   const [serveModalData, setServeModalData] = useState<{
     isOpen: boolean;
@@ -564,6 +566,20 @@ export default function App() {
           setUnifiedData(null);
           setRawData(section.raw || section);
           setShowSpotifyScraper(false);
+        }}
+      />
+    );
+  }
+
+  if (showSectionBuilder) {
+    return (
+      <SectionBuilderModal
+        onClose={() => setShowSectionBuilder(false)}
+        onVisualizeSection={(section) => {
+          setUnifiedSection(section);
+          setUnifiedData(null);
+          setRawData(section.raw || section);
+          setShowSectionBuilder(false);
         }}
       />
     );
@@ -1048,7 +1064,7 @@ export default function App() {
         </div>
 
         {/* Action / Scraper Entry Points */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <button
             onClick={() => setShowSpotifyScraper(true)}
             className="p-5 rounded-xl bg-gradient-to-br from-[#181818] to-neutral-900 border border-neutral-800 hover:border-[#1DB954]/50 transition-all text-left flex flex-col justify-between group shadow-lg"
@@ -1071,6 +1087,31 @@ export default function App() {
             </div>
             <div className="mt-4 flex items-center gap-1.5 text-xs text-[#1DB954] font-semibold">
               Launch Scraper <Play size={12} fill="currentColor" />
+            </div>
+          </button>
+
+          <button
+            onClick={() => setShowSectionBuilder(true)}
+            className="p-5 rounded-xl bg-gradient-to-br from-blue-950/40 via-neutral-900 to-neutral-900 border border-blue-500/40 hover:border-blue-400 transition-all text-left flex flex-col justify-between group shadow-lg"
+          >
+            <div>
+              <div className="flex items-center justify-between mb-3">
+                <div className="w-10 h-10 rounded-lg bg-blue-500/20 border border-blue-500/40 flex items-center justify-center text-blue-400">
+                  <LayoutList size={20} />
+                </div>
+                <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 bg-blue-950 text-blue-300 rounded border border-blue-500/30">
+                  Builder
+                </span>
+              </div>
+              <h3 className="text-base font-bold text-white group-hover:text-blue-400 transition-colors">
+                Custom Section
+              </h3>
+              <p className="text-xs text-neutral-400 mt-1 leading-relaxed">
+                Combine multiple playlists into a unified folder.
+              </p>
+            </div>
+            <div className="mt-4 flex items-center gap-1.5 text-xs text-blue-400 font-semibold">
+              Open Builder <ChevronLeft size={14} className="rotate-180" />
             </div>
           </button>
 

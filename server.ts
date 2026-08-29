@@ -589,7 +589,11 @@ async function fetchSpotifyEmbedPage(url: string, cookieInput?: any): Promise<an
   if (scriptMatch && scriptMatch[2]) {
     try {
       const parsed = JSON.parse(scriptMatch[2]);
-      if (parsed) return parsed;
+      if (parsed) {
+        // Handle Next.js __NEXT_DATA__ structure
+        const entity = parsed?.props?.pageProps?.state?.data?.entity;
+        return entity || parsed;
+      }
     } catch {}
   }
 
@@ -1235,6 +1239,7 @@ interface HostedItem {
   autoUpdateDaily: boolean;
   cookies?: string;
   tracks: any[];
+  playlists?: any[];
   raw?: any;
 }
 
@@ -1297,7 +1302,11 @@ async function refreshHostedItem(idOrSlug: string): Promise<HostedItem | null> {
     let name = item.name;
     let description = item.description;
 
-    if (item.sourceType === 'section' || item.sourceUrl.includes('/section/') || item.sourceUrl.includes('/hub/')) {
+    if (item.sourceUrl === 'custom-section') {
+      console.log(`[Daily Refresh] Skipping update for custom section: ${item.slug}`);
+      // Keep existing tracks/playlists
+      freshTracks = item.tracks || [];
+    } else if (item.sourceType === 'section' || item.sourceUrl.includes('/section/') || item.sourceUrl.includes('/hub/')) {
       const parts = item.sourceUrl.split(/[/?#]/);
       const idx = parts.findIndex(p => p === "section" || p === "hub");
       const secId = idx !== -1 ? parts[idx + 1] : parts[parts.length - 1];
@@ -1369,10 +1378,10 @@ app.get("/api/hosted/list", (req, res) => {
 // Serve / Publish a playlist to API
 app.post("/api/hosted/add", async (req, res) => {
   try {
-    const { name, description, sourceUrl, sourceType, tracks, coverUrl, autoUpdateDaily, cookies, slug: rawSlug } = req.body;
+    const { name, description, sourceUrl, sourceType, tracks, coverUrl, autoUpdateDaily, cookies, slug: rawSlug, raw, playlists } = req.body;
 
-    if (!name || !sourceUrl) {
-      return res.status(400).json({ error: "name and sourceUrl are required" });
+    if (!name || (!sourceUrl && !playlists)) {
+      return res.status(400).json({ error: "name and sourceUrl (or playlists) are required" });
     }
 
     const slug = sanitizeSlug(rawSlug || name);
@@ -1385,15 +1394,17 @@ app.post("/api/hosted/add", async (req, res) => {
       slug,
       name,
       description: description || `Served Spotify ${sourceType || 'playlist'}`,
-      sourceUrl,
-      sourceType: sourceType || (sourceUrl.includes('/section/') ? 'section' : 'playlist'),
-      trackCount: Array.isArray(tracks) ? tracks.length : 0,
+      sourceUrl: sourceUrl || 'custom-section',
+      sourceType: sourceType || (sourceUrl?.includes('/section/') ? 'section' : 'playlist'),
+      trackCount: Array.isArray(tracks) ? tracks.length : (Array.isArray(playlists) ? playlists.reduce((acc, p) => acc + (p.trackCount || p.trackList?.length || 0), 0) : 0),
       coverUrl: coverUrl || null,
       lastUpdated: now.toISOString(),
       nextRefreshAt: next24h.toISOString(),
       autoUpdateDaily: autoUpdateDaily !== false,
       cookies: cookies || undefined,
-      tracks: Array.isArray(tracks) ? tracks : []
+      tracks: Array.isArray(tracks) ? tracks : [],
+      playlists: Array.isArray(playlists) ? playlists : undefined,
+      raw: raw || undefined
     };
 
     hostedStore[slug] = newItem;
@@ -1487,7 +1498,9 @@ const handleServePublicJson = async (req: express.Request, res: express.Response
       nextRefreshAt: item.nextRefreshAt,
       autoUpdateDaily: item.autoUpdateDaily,
       hostedAt: `https://uvytunesspotify.vercel.app/api/${item.slug}.json`,
-      tracks: item.tracks
+      playlists: item.playlists,
+      tracks: item.tracks,
+      raw: item.raw
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message || "Failed to serve JSON endpoint" });

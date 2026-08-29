@@ -13,6 +13,8 @@ interface SectionViewProps {
     sourceUrl: string;
     sourceType?: 'playlist' | 'album' | 'section';
     tracks: any[];
+    playlists?: any[];
+    raw?: any;
     coverUrl: string | null;
   }) => void;
 }
@@ -164,6 +166,8 @@ export const SectionView: React.FC<SectionViewProps> = ({ section, onBack, onSel
                     sourceUrl: `https://open.spotify.com/section/${section.id}`,
                     sourceType: 'section',
                     tracks: section.playlists.flatMap(p => p.trackList || []),
+                    playlists: section.playlists,
+                    raw: section.raw,
                     coverUrl: section.playlists[0]?.coverUrl || null
                   })}
                   className="bg-emerald-500 hover:bg-emerald-400 text-black font-bold px-5 py-2.5 rounded-full transition-colors flex items-center gap-2 shadow-lg hover:scale-105 active:scale-95 duration-150 text-sm"

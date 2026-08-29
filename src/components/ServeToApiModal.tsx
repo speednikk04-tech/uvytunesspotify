@@ -11,6 +11,8 @@ interface ServeToApiModalProps {
     sourceUrl: string;
     sourceType?: 'playlist' | 'album' | 'section';
     tracks: UnifiedTrack[];
+    playlists?: any[];
+    raw?: any;
     coverUrl: string | null;
   } | null;
   onSuccess?: (endpoint: HostedPlaylistEndpoint) => void;
@@ -62,6 +64,8 @@ export const ServeToApiModal: React.FC<ServeToApiModalProps> = ({
           sourceUrl: playlistData.sourceUrl,
           sourceType: playlistData.sourceType || 'playlist',
           tracks: playlistData.tracks,
+          playlists: playlistData.playlists,
+          raw: playlistData.raw,
           coverUrl: playlistData.coverUrl,
           autoUpdateDaily,
           cookies: activeCookie
