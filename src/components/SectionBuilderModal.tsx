@@ -58,7 +58,7 @@ export const SectionBuilderModal: React.FC<SectionBuilderModalProps> = ({ onClos
       const newPlaylist: UnifiedSectionPlaylist = {
         id: data.id || data.uri || crypto.randomUUID(),
         uri: data.uri || `spotify:playlist:${crypto.randomUUID()}`,
-        name: data.name || data.title || 'Scraped Playlist',
+        name: data.name || data.title || data.subtitle || 'Scraped Playlist',
         description: data.description || data.owner?.display_name || 'Custom Added',
         coverUrl: playlistCover,
         trackCount: trackList.length,
