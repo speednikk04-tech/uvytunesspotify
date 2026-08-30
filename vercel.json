@@ -4,6 +4,14 @@
   "outputDirectory": "dist",
   "rewrites": [
     {
+      "source": "/api/scrape",
+      "destination": "/api/scrape"
+    },
+    {
+      "source": "/api/canvas",
+      "destination": "/api/canvas"
+    },
+    {
       "source": "/api/(.*)",
       "destination": "/api/index"
     },
