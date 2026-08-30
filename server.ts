@@ -1,6 +1,6 @@
 import express from "express";
 import path from "path";
-import app, { hostedStore, refreshHostedItem } from "./api/app.ts";
+import app, { hostedStore, refreshHostedItem } from "./api/_app.ts";
 
 async function startServer() {
   const PORT = 3000;
