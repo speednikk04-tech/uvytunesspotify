@@ -1711,7 +1711,9 @@ async function startServer() {
   });
 }
 
-if (process.env.VERCEL !== '1') {
+const isServerless = process.env.VERCEL === '1' || process.env.NOW_REGION !== undefined || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+if (!isServerless) {
   startServer();
 }
 
