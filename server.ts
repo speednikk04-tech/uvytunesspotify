@@ -2,63 +2,20 @@ import express from "express";
 import path from "path";
 import crypto from "crypto";
 import fs from "fs";
-// @ts-ignore
-import spotifyUrlInfo from "spotify-url-info";
-
-// Hardcoded Cloudflare Worker Proxy URL for Spotify Edge Scraper
-const HARDCODED_CF_WORKER_URL = "https://spotify.nikkexe.workers.dev";
-
-// Create custom fetch with Chrome User-Agent & Headers to bypass Cloudflare / Datacenter IP blocks on Vercel
-const createCustomFetch = (cookieInput?: any) => {
-  const parsed = parseSpotifyCookies(cookieInput);
-  const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : undefined);
-
-  return (url: string, opts: any = {}) => {
-    // Route requests through Cloudflare Worker Proxy
-    const workerProxy = process.env.CF_WORKER_URL || HARDCODED_CF_WORKER_URL;
-    let targetUrl = url;
-    if (workerProxy) {
-      const cleanProxy = workerProxy.replace(/\/$/, "");
-      targetUrl = `${cleanProxy}/proxy?url=${encodeURIComponent(url)}`;
-    }
-
-    const headers: Record<string, string> = {
-      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9",
-      "Cache-Control": "no-cache",
-      "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-      "Sec-Ch-Ua-Mobile": "?0",
-      "Sec-Ch-Ua-Platform": '"macOS"',
-      "Sec-Fetch-Dest": "document",
-      "Sec-Fetch-Mode": "navigate",
-      "Sec-Fetch-Site": "same-origin",
-      "Sec-Fetch-User": "?1",
-      "Upgrade-Insecure-Requests": "1",
-      ...(opts.headers || {})
-    };
-
-    if (cookieHeader && !headers["Cookie"]) {
-      headers["Cookie"] = cookieHeader;
-    }
-
-    return fetch(targetUrl, {
-      ...opts,
-      headers
-    });
-  };
-};
+import * as spotifyUrlInfoModule from "spotify-url-info";
 
 // Safe initializer for spotify-url-info supporting CJS/ESM interop
 function initSpotifyUrlInfo(customFetchFn: any) {
   try {
-    // @ts-ignore
-    const fn = typeof spotifyUrlInfo === "function" ? spotifyUrlInfo : (spotifyUrlInfo && spotifyUrlInfo.default);
+    const sui: any = spotifyUrlInfoModule;
+    const fn = typeof sui === "function" 
+      ? sui 
+      : (sui && sui.default && typeof sui.default === "function" ? sui.default : sui?.default?.default);
     if (typeof fn === "function") {
       return fn(customFetchFn);
     }
-  } catch (e) {
-    console.warn("Could not initialize spotify-url-info:", e);
+  } catch (e: any) {
+    console.warn("Could not initialize spotify-url-info:", e?.message || e);
   }
   return null;
 }
@@ -219,6 +176,50 @@ function parseSpotifyCookies(input: any): {
     }))
   };
 }
+
+// Hardcoded Cloudflare Worker Proxy URL for Spotify Edge Scraper
+const HARDCODED_CF_WORKER_URL = "https://spotify.nikkexe.workers.dev";
+
+// Create custom fetch with Chrome User-Agent & Headers to bypass Cloudflare / Datacenter IP blocks on Vercel
+const createCustomFetch = (cookieInput?: any) => {
+  const parsed = parseSpotifyCookies(cookieInput);
+  const cookieHeader = parsed.cookieHeader || (parsed.spDc ? `sp_dc=${parsed.spDc}` : undefined);
+
+  return (url: string, opts: any = {}) => {
+    // Route requests through Cloudflare Worker Proxy
+    const workerProxy = process.env.CF_WORKER_URL || HARDCODED_CF_WORKER_URL;
+    let targetUrl = url;
+    if (workerProxy) {
+      const cleanProxy = workerProxy.replace(/\/$/, "");
+      targetUrl = `${cleanProxy}/proxy?url=${encodeURIComponent(url)}`;
+    }
+
+    const headers: Record<string, string> = {
+      "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Cache-Control": "no-cache",
+      "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      "Sec-Ch-Ua-Mobile": "?0",
+      "Sec-Ch-Ua-Platform": '"macOS"',
+      "Sec-Fetch-Dest": "document",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-Site": "same-origin",
+      "Sec-Fetch-User": "?1",
+      "Upgrade-Insecure-Requests": "1",
+      ...(opts.headers || {})
+    };
+
+    if (cookieHeader && !headers["Cookie"]) {
+      headers["Cookie"] = cookieHeader;
+    }
+
+    return fetch(targetUrl, {
+      ...opts,
+      headers
+    });
+  };
+};
 
 async function verifySpotifyCookies(cookieInput: any) {
   const parsed = parseSpotifyCookies(cookieInput);
@@ -1362,10 +1363,18 @@ app.use((req, res, next) => {
   next();
 });
 
+// Create unified API router supporting both prefixed (/api/...) and non-prefixed (/...) requests
+const apiRouter = express.Router();
+
+// Health Check
+apiRouter.get("/health", (req, res) => {
+  res.json({ status: "ok", service: "uvytunesspotify-api", timestamp: new Date().toISOString() });
+});
+
 // === HOSTED PLAYLISTS API ENDPOINTS ===
 
 // List all published API endpoints
-app.get("/api/hosted/list", (req, res) => {
+apiRouter.get("/hosted/list", (req, res) => {
   const items = Object.values(hostedStore).map(item => ({
     ...item,
     publicUrl: `/api/public/${item.slug}.json`,
@@ -1376,7 +1385,7 @@ app.get("/api/hosted/list", (req, res) => {
 });
 
 // Serve / Publish a playlist to API
-app.post("/api/hosted/add", async (req, res) => {
+apiRouter.post("/hosted/add", async (req, res) => {
   try {
     const { name, description, sourceUrl, sourceType, tracks, coverUrl, autoUpdateDaily, cookies, slug: rawSlug, raw, playlists } = req.body;
 
@@ -1426,7 +1435,7 @@ app.post("/api/hosted/add", async (req, res) => {
 });
 
 // Force Refresh Hosted Endpoint
-app.post("/api/hosted/refresh/:id", async (req, res) => {
+apiRouter.post("/hosted/refresh/:id", async (req, res) => {
   try {
     const updated = await refreshHostedItem(req.params.id);
     if (!updated) {
@@ -1439,7 +1448,7 @@ app.post("/api/hosted/refresh/:id", async (req, res) => {
 });
 
 // Delete Hosted Endpoint
-app.delete("/api/hosted/:id", (req, res) => {
+apiRouter.delete("/hosted/:id", (req, res) => {
   const idOrSlug = req.params.id;
   const key = Object.keys(hostedStore).find(k => hostedStore[k].id === idOrSlug || hostedStore[k].slug === idOrSlug || k === idOrSlug);
 
@@ -1507,94 +1516,38 @@ const handleServePublicJson = async (req: express.Request, res: express.Response
   }
 };
 
-app.get("/api/public/:slug.json", handleServePublicJson);
-app.get("/api/public/:slug", handleServePublicJson);
-app.get("/api/hosted/:slug", handleServePublicJson);
-app.get("/api/hosted/:slug.json", handleServePublicJson);
+apiRouter.get("/public/:slug.json", handleServePublicJson);
+apiRouter.get("/public/:slug", handleServePublicJson);
+apiRouter.get("/hosted/:slug", handleServePublicJson);
+apiRouter.get("/hosted/:slug.json", handleServePublicJson);
 
 // Vercel Export endpoint to download / view Vercel deployment code
-app.get("/api/vercel/export-code", (req, res) => {
+apiRouter.get("/vercel/export-code", (req, res) => {
   const hostedList = Object.values(hostedStore);
 
   const vercelJson = {
     "version": 2,
     "name": "uvytunesspotify-api",
-    "builds": [
-      { "src": "api/*.js", "use": "@vercel/node" }
-    ],
-    "routes": [
-      { "src": "/api/(.*).json", "dest": "/api/[slug].js?slug=$1" },
-      { "src": "/api/(.*)", "dest": "/api/[slug].js?slug=$1" }
+    "rewrites": [
+      { "source": "/api/(.*)", "destination": "/api" },
+      { "source": "/((?!api/).*)", "destination": "/index.html" }
     ]
   };
 
-  const apiSlugJs = `// Vercel Serverless Function: api/[slug].js
-// Serves fresh daily-updated Spotify & iTunes playlist JSONs for uvytunesspotify.vercel.app
-
-const HOSTED_PLAYLISTS = ${JSON.stringify(hostedList, null, 2)};
-
-export default async function handler(req, res) {
-  res.setHeader('Access-Control-Allow-Credentials', true);
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.setHeader('Cache-Control', 's-maxage=86400, stale-while-revalidate=3600');
-
-  if (req.method === 'OPTIONS') {
-    res.status(200).end();
-    return;
-  }
-
-  const querySlug = req.query.slug || req.query.playlist || req.url.replace(/^\\/api\\//, '').replace(/\\.json$/, '');
-  const cleanSlug = String(querySlug).trim().toLowerCase().replace(/\\.json$/, '');
-
-  const match = HOSTED_PLAYLISTS.find(p => p.slug === cleanSlug || p.id === cleanSlug);
-
-  if (!match) {
-    return res.status(404).json({
-      error: "Playlist API Endpoint Not Found",
-      slug: cleanSlug,
-      availableEndpoints: HOSTED_PLAYLISTS.map(p => \`/api/\${p.slug}.json\`)
-    });
-  }
-
-  return res.status(200).json({
-    status: "ok",
-    slug: match.slug,
-    name: match.name,
-    description: match.description,
-    sourceUrl: match.sourceUrl,
-    coverUrl: match.coverUrl,
-    trackCount: match.trackCount,
-    lastUpdated: match.lastUpdated,
-    nextRefreshAt: match.nextRefreshAt,
-    autoUpdateDaily: match.autoUpdateDaily,
-    tracks: match.tracks
-  });
-}
-`;
-
-  const readmeMd = `# uvytunesspotify Vercel API Server
-
-Serves JSON playlist endpoints hosted at \`uvytunesspotify.vercel.app/api/:playlist-name.json\`.
-
-## Deployment Instructions
-
-1. Install Vercel CLI: \`npm i -g vercel\`
-2. Run \`vercel\` in this directory to deploy directly to Vercel!
-3. Your endpoints will immediately be available at:
-   - \`https://uvytunesspotify.vercel.app/api/playlist-name.json\`
+  const apiIndexJs = `// Vercel Serverless Function: api/index.js
+import app from '../server';
+export default app;
 `;
 
   res.json({
     "vercel.json": JSON.stringify(vercelJson, null, 2),
-    "api/[slug].js": apiSlugJs,
-    "README.md": readmeMd,
+    "api/index.js": apiIndexJs,
     hostedCount: hostedList.length
   });
 });
 
 // API Route: Verify and inspect pasted Spotify cookies
-app.post("/api/cookies/verify", async (req, res) => {
+apiRouter.post("/cookies/verify", async (req, res) => {
   try {
     const cookieInput = req.body?.cookies || req.body?.sp_dc || req.body;
     const verification = await verifySpotifyCookies(cookieInput);
@@ -1646,9 +1599,9 @@ const handleScrapeRequest = async (req: express.Request, res: express.Response) 
   }
 };
 
-// API Routes for scraping (GET & POST supported)
-app.get("/api/scrape", handleScrapeRequest);
-app.post("/api/scrape", handleScrapeRequest);
+// Scraping routes on router
+apiRouter.get("/scrape", handleScrapeRequest);
+apiRouter.post("/scrape", handleScrapeRequest);
 
 // Dedicated Section Scrape endpoint
 const handleSectionScrape = async (req: express.Request, res: express.Response) => {
@@ -1670,8 +1623,8 @@ const handleSectionScrape = async (req: express.Request, res: express.Response) 
   }
 };
 
-app.get("/api/scrape/section", handleSectionScrape);
-app.post("/api/scrape/section", handleSectionScrape);
+apiRouter.get("/scrape/section", handleSectionScrape);
+apiRouter.post("/scrape/section", handleSectionScrape);
 
 // Dedicated Canvas endpoint
 const handleCanvasRequest = async (req: express.Request, res: express.Response) => {
@@ -1691,8 +1644,32 @@ const handleCanvasRequest = async (req: express.Request, res: express.Response) 
   }
 };
 
-app.get("/api/canvas", handleCanvasRequest);
-app.post("/api/canvas", handleCanvasRequest);
+apiRouter.get("/canvas", handleCanvasRequest);
+apiRouter.post("/canvas", handleCanvasRequest);
+
+// Slug JSON route on router (e.g., /api/:slug.json or /api/:slug)
+apiRouter.get("/:slug.json", handleServePublicJson);
+
+// Mount router under BOTH "/api" AND "/" so whether Vercel strips /api or keeps it, every route resolves perfectly!
+app.use("/api", apiRouter);
+app.use("/", apiRouter);
+
+// Direct app fallback bindings for maximum compatibility
+app.all("/api/scrape", handleScrapeRequest);
+app.all("/scrape", handleScrapeRequest);
+app.all("/api/scrape/section", handleSectionScrape);
+app.all("/scrape/section", handleSectionScrape);
+app.all("/api/canvas", handleCanvasRequest);
+app.all("/canvas", handleCanvasRequest);
+
+// Explicit API 404 handler - prevents unhandled /api requests from EVER returning index.html
+app.all(["/api", "/api/*all"], (req, res) => {
+  res.status(404).json({
+    error: "API route not found",
+    method: req.method,
+    path: req.originalUrl || req.url
+  });
+});
 
 async function startServer() {
   const PORT = 3000;
